@@ -1,0 +1,87 @@
+# cn-printer ./test override — the same stack with VIRTUAL devices and no
+# homelab dependencies (no tailnet, no host avahi, no kaiser, no S3):
+#   * ts-printer becomes a plain netns holder (alpine sleep); ports move to
+#     127.0.0.1:1xxxx so a Mac's own cupsd on :631 never collides
+#   * ippeve: ippeveprinter stands in for the Brother at ipp://localhost:8631
+#   * the SANE `test` backend stands in for the scanner (test:0)
+#   * production-only services move behind the `prod` profile
+# Used by ./test: docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test
+services:
+  ts-printer:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    cap_add: !reset []
+    devices: !reset []
+    volumes: !reset []
+    environment: !reset []
+    ports: !override
+      - "127.0.0.1:16310:631"    # cups
+      - "127.0.0.1:18080:8080"   # scanservjs
+      - "127.0.0.1:15520:5520"   # swis
+      - "127.0.0.1:19329:9329"   # cups-exporter (joins the netns in test)
+
+  ippeve:
+    image: cn-printer-ippeve:test
+    build:
+      context: ./cups
+      dockerfile: Dockerfile.ippeve
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer]
+    # -r off: no DNS-SD; -k keep spool files; -f mimics what the Brother
+    # advertises (PDF included — proves the queue still sends raster).
+    command: ["-v", "-p", "8631", "-d", "/spool", "-k", "-r", "off", "-n", "localhost",
+              "-f", "application/pdf,image/pwg-raster,image/urf,image/jpeg",
+              "-M", "Brother", "-m", "MFC-L2750DW series", "Virtual Brother"]
+    volumes:
+      - ippeve_spool:/spool
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  cups:
+    depends_on: [ts-printer, ippeve]
+    environment:
+      - CUPS_BROWSING=Off          # no host avahi/D-Bus in test
+      - PRINTER_WAIT_SECONDS=90
+    volumes: !override
+      - cups_etc:/etc/cups
+      - ${CUPS_LOG_DIR}:/var/log/cups
+
+  scanservjs:
+    volumes: !override
+      - ./.test/airscan.conf:/etc/sane.d/airscan.conf:ro
+      - ./sane/dll.conf:/etc/sane.d/dll.conf:ro
+      - ./sane/test.conf:/etc/sane.d/test.conf:ro
+      - ./scanservjs/config.local.js:/etc/scanservjs/config.local.js:ro
+      - scanservjs_data:/var/lib/scanservjs
+      - ${SCANS_DIR}:/var/lib/scanservjs/output
+
+  swis:
+    environment:
+      - SWIS_PUBLIC_HOST=localhost
+      - SWIS_PORT=5520
+    volumes: !override
+      - ./.test/airscan.conf:/etc/sane.d/airscan.conf:ro
+      - ./sane/dll.conf:/etc/sane.d/dll.conf:ro
+      - ./sane/test.conf:/etc/sane.d/test.conf:ro
+      - ${SCANS_DIR}:/srv/scans
+
+  cups-exporter:
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer, cups]
+    environment:
+      - CUPS_SERVER=localhost:631
+      - PRINTER_IPP_URI=ipp://localhost:8631/ipp/print
+      - EXPORTER_PORT=9329
+
+  node-exporter-lan:
+    profiles: ["prod"]
+  promtail-lan:
+    profiles: ["prod"]
+  watchtower:
+    profiles: ["prod"]
+  backup:
+    profiles: ["prod"]
+
+volumes:
+  ippeve_spool:

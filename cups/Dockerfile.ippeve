@@ -1,0 +1,12 @@
+# cn-printer ./test only — the VIRTUAL printer. ippeveprinter (CUPS 2.4) calls
+# dnssd_init() unconditionally, even with `-r off`, so it needs a D-Bus +
+# avahi inside its container. Kept out of the production cups image on
+# purpose: cupsd there publishes through the HOST avahi.
+FROM debian:trixie-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cups-ipp-utils avahi-daemon dbus file \
+ && rm -rf /var/lib/apt/lists/*
+COPY ippeve-entrypoint.sh /usr/local/bin/ippeve-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/ippeve-entrypoint.sh && mkdir -p /spool
+ENTRYPOINT ["/usr/local/bin/ippeve-entrypoint.sh"]

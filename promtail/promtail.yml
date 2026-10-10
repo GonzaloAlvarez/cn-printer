@@ -1,0 +1,68 @@
+# promtail-lan on printer.lan — ships docker container logs, the systemd
+# journal and the CUPS page/error logs to kaiser Loki. Labels stack="cn-printer",
+# host="printer", source="lan" so kaiser Grafana can filter by stack/host.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://10.1.1.140:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        target_label: project
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      - target_label: stack
+        replacement: cn-printer
+      - target_label: host
+        replacement: printer
+      - target_label: source
+        replacement: lan
+
+  - job_name: journal
+    journal:
+      max_age: 12h
+      path: /var/log/journal
+      labels:
+        job: systemd-journal
+        stack: cn-printer
+        host: printer
+        source: lan
+    relabel_configs:
+      - source_labels: [__journal__systemd_unit]
+        target_label: unit
+
+  # CUPS page_log: one line per printed page group
+  #   <printer> <user> <job-id> <date> <pages> <copies> <billing> <client> <job-name> <media> <sides>
+  # (PageLogFormat set by cn-printer's cupsd.conf). The CUPS dashboard counts
+  # pages/jobs per user from these lines.
+  - job_name: cups-page-log
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: cups-page-log
+          stack: cn-printer
+          host: printer
+          source: lan
+          __path__: /var/log/cups/page_log
+  - job_name: cups-error-log
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: cups-error-log
+          stack: cn-printer
+          host: printer
+          source: lan
+          __path__: /var/log/cups/error_log

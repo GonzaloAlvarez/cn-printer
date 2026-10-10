@@ -1,0 +1,6 @@
+.env
+.env.test.local
+.test/
+cups/log/
+*.bak
+.DS_Store

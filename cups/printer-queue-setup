@@ -1,0 +1,149 @@
+#!/bin/bash
+# printer-queue-setup — idempotent raster-only IPP queue for CUPS.
+#
+# Generates the printer's IPP Everywhere PPD, keeps ONLY the *cupsFilter2
+# conversions whose destination type is in --keep-formats (default
+# image/pwg-raster,image/urf) and drops every passthrough (application/pdf,
+# image/jpeg, PostScript, PCLm …) so CUPS always rasterizes on this machine —
+# the printer's own PDF/PostScript interpreter never sees a document again.
+#
+# Usage: printer-queue-setup [options] <ipp-uri>
+#   --name Q              queue name (default Brother_MFC-L2750DW)
+#   --description T       printer-info          --location T   printer-location
+#   --wait S              seconds to wait for IPP Get-Printer-Attributes (default 60; 0 = one try)
+#   --keep-formats a,b    cupsFilter2 destination types to keep
+#   --default|--no-default  make it the default destination (default: --default)
+#   --shared|--no-shared    printer-is-shared (default: --shared)
+#   --state-dir D         copy of the generated PPD for change detection (default /etc/cups/cn-printer)
+#   --show                print the raster-only PPD and exit
+# Prints CHANGED | UNCHANGED | SKIPPED: <reason>.  Exit 0 ok, 3 printer unreachable, 1 error.
+set -euo pipefail
+
+Q="Brother_MFC-L2750DW"; DESC=""; LOC=""; WAIT=60; KEEP="image/pwg-raster,image/urf"
+DEFAULT=1; SHARED=1; STATE="/etc/cups/cn-printer"; SHOW=0; URI=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) Q="$2"; shift 2 ;;
+    --description) DESC="$2"; shift 2 ;;
+    --location) LOC="$2"; shift 2 ;;
+    --wait) WAIT="$2"; shift 2 ;;
+    --keep-formats) KEEP="$2"; shift 2 ;;
+    --default) DEFAULT=1; shift ;;
+    --no-default) DEFAULT=0; shift ;;
+    --shared) SHARED=1; shift ;;
+    --no-shared) SHARED=0; shift ;;
+    --state-dir) STATE="$2"; shift 2 ;;
+    --show) SHOW=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; exit 1 ;;
+    *) URI="$1"; shift ;;
+  esac
+done
+[ -n "$URI" ] || { echo "ERROR: <ipp-uri> required" >&2; exit 1; }
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# ── 1. probe the printer ────────────────────────────────────────────────────
+cat > "$TMP/gpa.test" <<'IPP'
+{
+  OPERATION Get-Printer-Attributes
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  STATUS successful-ok
+}
+IPP
+deadline=$(( $(date +%s) + WAIT ))
+while ! ipptool -T 5 "$URI" "$TMP/gpa.test" >/dev/null 2>&1; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "SKIPPED: ${URI} did not answer IPP Get-Printer-Attributes within ${WAIT}s"
+    exit 3
+  fi
+  sleep 3
+done
+
+# ── 2. generate the IPP Everywhere PPD ──────────────────────────────────────
+gen_ppd() {
+  if command -v driverless >/dev/null 2>&1 && driverless cat "$URI" > "$TMP/gen.ppd" 2>/dev/null \
+     && grep -q '^\*PPD-Adobe' "$TMP/gen.ppd"; then
+    return 0
+  fi
+  # fallback: let cupsd build it on a temporary queue
+  local tq="${Q}__gen"
+  lpadmin -p "$tq" -v "$URI" -m everywhere >/dev/null 2>&1 || return 1
+  cp "/etc/cups/ppd/${tq}.ppd" "$TMP/gen.ppd" && lpadmin -x "$tq" >/dev/null 2>&1
+  grep -q '^\*PPD-Adobe' "$TMP/gen.ppd"
+}
+gen_ppd || { echo "ERROR: could not generate a PPD for ${URI}" >&2; exit 1; }
+
+# ── 3. keep-list strip of *cupsFilter2 lines ────────────────────────────────
+set +e
+awk -v keep="$KEEP" '
+  BEGIN { n = split(keep, K, ","); for (i = 1; i <= n; i++) keepset[K[i]] = 1; kept = 0 }
+  /^\*cupsFilter2:/ {
+    if (match($0, /"[^"]*"/)) {
+      v = substr($0, RSTART + 1, RLENGTH - 2); split(v, f, " ")
+      if (f[2] in keepset) { print; kept++ }
+    }
+    next
+  }
+  /^\*cupsFilter:/ { next }
+  { print }
+  END { if (kept == 0) exit 42 }
+' "$TMP/gen.ppd" > "$TMP/raster.ppd"
+rc=$?
+set -e
+if [ "$rc" -eq 42 ]; then
+  echo "ERROR: ${URI} advertises none of ${KEEP}; refusing to create a passthrough queue" >&2
+  exit 1
+elif [ "$rc" -ne 0 ]; then
+  echo "ERROR: PPD filtering failed (awk rc=${rc})" >&2; exit 1
+fi
+printf '*%% cn-printer: raster-only PPD for %s; kept cupsFilter2 destinations: %s\n' "$URI" "$KEEP" >> "$TMP/raster.ppd"
+
+if [ "$SHOW" -eq 1 ]; then cat "$TMP/raster.ppd"; exit 0; fi
+
+# ── 4. compare live state ───────────────────────────────────────────────────
+mkdir -p "$STATE"
+needs_apply=0
+# every probe below must tolerate "queue does not exist yet" under set -e/pipefail
+live_uri="$(lpstat -v "$Q" 2>/dev/null | sed -n 's/^device for [^:]*: //p' || true)"
+[ "$live_uri" = "$URI" ] || needs_apply=1
+if [ -f "$STATE/$Q.ppd" ]; then
+  diff -q <(grep -v '^\*%' "$STATE/$Q.ppd") <(grep -v '^\*%' "$TMP/raster.ppd") >/dev/null 2>&1 || needs_apply=1
+else
+  needs_apply=1
+fi
+if [ -f "/etc/cups/ppd/$Q.ppd" ]; then
+  if grep '^\*cupsFilter2:' "/etc/cups/ppd/$Q.ppd" | awk -v keep="$KEEP" '
+       BEGIN { n = split(keep, K, ","); for (i = 1; i <= n; i++) keepset[K[i]] = 1 }
+       { if (match($0, /"[^"]*"/)) { v = substr($0, RSTART + 1, RLENGTH - 2); split(v, f, " "); if (!(f[2] in keepset)) bad++ } }
+       END { exit (bad > 0) ? 1 : 0 }'; then :; else needs_apply=1; fi
+else
+  needs_apply=1
+fi
+want_shared=$([ "$SHARED" -eq 1 ] && echo true || echo false)
+lpoptions -p "$Q" 2>/dev/null | tr ' ' '\n' | grep -qx "printer-is-shared=${want_shared}" || needs_apply=1
+lpstat -p "$Q" 2>/dev/null | grep -q 'enabled since' || needs_apply=1
+lpstat -a "$Q" 2>/dev/null | grep -q 'accepting requests' || needs_apply=1
+if [ "$DEFAULT" -eq 1 ]; then
+  lpstat -d 2>/dev/null | grep -q "destination: ${Q}\$" || needs_apply=1
+fi
+
+if [ "$needs_apply" -eq 0 ]; then echo "UNCHANGED"; exit 0; fi
+
+# ── 5. apply ────────────────────────────────────────────────────────────────
+args=(-p "$Q" -v "$URI" -P "$TMP/raster.ppd" -o "printer-is-shared=${want_shared}" -E)
+[ -n "$DESC" ] && args+=(-D "$DESC")
+[ -n "$LOC" ] && args+=(-L "$LOC")
+# lpadmin warns "Printer drivers are deprecated" on every -P; keep stderr for real errors only
+if ! lp_err="$(lpadmin "${args[@]}" 2>&1)"; then
+  echo "ERROR: lpadmin failed: ${lp_err}" >&2
+  exit 1
+fi
+cupsenable "$Q" >/dev/null 2>&1 || true
+cupsaccept "$Q" >/dev/null 2>&1 || true
+[ "$DEFAULT" -eq 1 ] && lpadmin -d "$Q"
+install -m 0644 "$TMP/raster.ppd" "$STATE/$Q.ppd"
+echo "CHANGED"

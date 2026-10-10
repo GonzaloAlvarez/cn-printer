@@ -1,0 +1,168 @@
+#!/bin/bash
+# cn-printer/test — bring the stack up with VIRTUAL devices and prove the two
+# user journeys end to end, anywhere Docker runs (the Mac, a kora VM, rpid11):
+#   print: lp → CUPS raster-only queue → ippeveprinter spool holds PWG/URF raster, never PDF
+#   scan : scanservjs REST on the SANE `test` device → downloadable PNG and PDF
+#   swis : UI up, upload + print → a second raster job
+#   cups-exporter: cups_up 1, printer state idle
+#   ./test [--in-vm] [--keep]      --keep leaves the stack up for inspection
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+KEEP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --in-vm) ;;                       # accepted for symmetry with amun-printer/tests/vm-e2e.sh
+    --keep) KEEP=1 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+P=cn-printer-test
+DC=(docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test -p "$P")
+CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; SWIS=http://127.0.0.1:15520; EXP=http://127.0.0.1:19329
+Q=Brother_MFC-L2750DW
+PASS=0; FAIL=0; WARN=0; SKIP=0
+LINUX=0; [ "$(uname -s)" = Linux ] && LINUX=1   # bind-mount ownership is only meaningful on Linux (Docker Desktop virtualizes it)
+ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS + 1)); }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL + 1)); }
+wrn()  { printf '  \033[33mWARN\033[0m  %s\n' "$1"; WARN=$((WARN + 1)); }
+skp()  { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; SKIP=$((SKIP + 1)); }
+check(){ local label="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; fi; }
+exec 3>&1
+evidence() { echo "EVIDENCE: $*" >&3; }
+note() { echo "      | $*" >&3; }
+cx() { "${DC[@]}" exec -T "$@"; }
+magic() { head -c 8 "$1" | od -An -c | tr -d ' \n'; }
+has_magic() { LC_ALL=C grep -qa -E "$2" <(head -c 8 "$1"); }
+describe() { if command -v file >/dev/null 2>&1; then file -b "$1"; else echo "magic=$(magic "$1")"; fi; }
+cleanup() {
+  if [ "$KEEP" -eq 1 ]; then echo "[test] --keep: stack left up (docker compose -p $P ...)"; return; fi
+  "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "== cn-printer test =="
+mkdir -p .test/scans/swis .test/cups-log
+chmod 0777 .test/scans .test/scans/swis .test/cups-log            # containers write as uid 1000 / root
+printf '[options]\ndiscovery = disable\n' > .test/airscan.conf    # no real scanner in test
+
+check "compose config renders" "${DC[@]}" config --quiet
+echo "[test] building images and starting the stack"
+"${DC[@]}" up -d --build --remove-orphans >/dev/null
+
+wait_healthy() { # name timeout
+  local c="${P}-$1-1" i
+  for ((i = 0; i < $2; i += 5)); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null)" = "healthy" ] && return 0
+    sleep 5
+  done
+  docker logs --tail 40 "$c" 2>&1 | sed 's/^/      | /'
+  return 1
+}
+check "cups healthy"          wait_healthy cups 180
+check "cups web UI answers on the published port" curl -fs -o /dev/null "$CUPS/"
+check "scanservjs healthy"    wait_healthy scanservjs 180
+check "swis healthy"          wait_healthy swis 180
+check "cups-exporter healthy" wait_healthy cups-exporter 120
+
+# ── print path ───────────────────────────────────────────────────────────────
+echo; echo "Print:"
+queue_ready() { cx cups lpstat -v "$Q" 2>/dev/null | grep -q 'ipp://localhost:8631/ipp/print'; }
+for ((i = 0; i < 120; i += 5)); do queue_ready && break; sleep 5; done
+check "queue $Q on ipp://localhost:8631 (virtual Brother)" queue_ready
+check "queue is the default destination" bash -c "$(printf '%q ' "${DC[@]}") exec -T cups lpstat -d | grep -q 'destination: $Q\$'"
+check "queue is shared"       bash -c "$(printf '%q ' "${DC[@]}") exec -T cups lpoptions -p $Q | tr ' ' '\n' | grep -qx printer-is-shared=true"
+if out="$(cx cups printer-queue-setup --wait 10 --name "$Q" --state-dir /etc/cups/cn-printer ipp://localhost:8631/ipp/print 2>&1)"; then
+  [ "$out" = "UNCHANGED" ] && ok "printer-queue-setup is idempotent (UNCHANGED)" || bad "printer-queue-setup second run printed '$out'"
+else
+  bad "printer-queue-setup re-run failed: $out"
+fi
+filters="$(cx cups grep '^\*cupsFilter2' "/etc/cups/ppd/$Q.ppd" || true)"
+evidence "PPD cupsFilter2 lines: $(echo "$filters" | tr '\n' ' ')"
+check "PPD keeps a raster conversion"      bash -c "echo \"\$0\" | grep -Eq 'image/(pwg-raster|urf)'" "$filters"
+check "PPD has no PDF passthrough"         bash -c "! echo \"\$0\" | grep -q 'application/pdf'" "$filters"
+check "PPD has no JPEG passthrough"        bash -c "! echo \"\$0\" | grep -q 'image/jpeg'" "$filters"
+
+check "test PDF generated inside cups (ghostscript)" cx cups bash -c "gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=/tmp/awkward.pdf -c '/Helvetica findfont 24 scalefont setfont 72 700 moveto (cn-printer test page 1) show 72 600 moveto 300 0 rlineto 0 -200 rlineto -300 0 rlineto closepath 0.5 setgray fill showpage 72 700 moveto (page 2) show showpage' && test -s /tmp/awkward.pdf"
+before="$(cx ippeve sh -c 'ls -1 /spool 2>/dev/null | wc -l' | tr -d ' ')"
+check "lp submits the PDF" cx cups lp -d "$Q" -t awkward /tmp/awkward.pdf
+drained() { [ -z "$(cx cups lpstat -o 2>/dev/null)" ]; }
+for ((i = 0; i < 90; i += 3)); do drained && break; sleep 3; done
+if ! drained; then cx cups lpstat -p "$Q" -o || true; cx cups tail -30 /var/log/cups/error_log || true; fi
+check "job left the queue"    drained
+after="$(cx ippeve sh -c 'ls -1 /spool 2>/dev/null | wc -l' | tr -d ' ')"
+check "virtual printer received a document" test "$after" -gt "$before"
+newest="$(cx ippeve sh -c 'ls -1t /spool | head -1' | tr -d '\r')"
+mkdir -p .test/out && docker cp "${P}-ippeve-1:/spool/${newest}" ".test/out/${newest}" >/dev/null 2>&1 || true
+if [ -f ".test/out/${newest}" ]; then
+  evidence "print → ${newest}: $(describe ".test/out/${newest}")"
+  check "document is PWG/URF raster, not PDF" bash -c "LC_ALL=C grep -qa -E '^(RaS2|RaS3|UNIRAST)' <(head -c 8 '.test/out/${newest}') && ! LC_ALL=C grep -qa '%PDF' <(head -c 4 '.test/out/${newest}')"
+else
+  bad "could not copy the spooled document out of ippeve"
+fi
+
+# ── scan path (scanservjs REST on the SANE test device) ──────────────────────
+echo; echo "Scan:"
+curl -fsS -X DELETE "$SCAN/api/v1/context" >/dev/null 2>&1 || true
+dev=""
+for ((i = 0; i < 60; i += 5)); do
+  dev="$(curl -fsS "$SCAN/api/v1/context" 2>/dev/null | python3 -c 'import json,sys
+d=json.load(sys.stdin); ids=[x["id"] for x in d.get("devices",[]) if x["id"].startswith("test:")]; print(ids[0] if ids else "")' 2>/dev/null || true)"
+  [ -n "$dev" ] && break; sleep 5
+done
+check "scanservjs lists the sane-test device" test -n "$dev"
+scan_one() { # pipeline expected-magic-regex label
+  local body resp name out
+  body="$(python3 -c 'import json,sys; print(json.dumps({"params":{"deviceId":sys.argv[1],"resolution":300,"mode":"Color","source":"Flatbed","top":0,"left":0,"width":210,"height":297},"filters":[],"pipeline":sys.argv[2],"batch":"none","index":1}))' "$dev" "$1")"
+  resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan")" || { note "scan ($1): request failed"; return 1; }
+  name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["file"]["name"])' "$resp" 2>/dev/null)" || { note "scan ($1): $resp"; return 1; }
+  out=".test/out/$name"
+  local enc; enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$name")"
+  curl -fsS -o "$out" "$SCAN/api/v1/files/$enc" || return 1
+  evidence "scan ($1) → $name: $(describe "$out") (owner uid $(cx scanservjs stat -c %u "/var/lib/scanservjs/output/$name" 2>/dev/null | tr -d '\r'))"
+  has_magic "$out" "$2" || { note "scan ($1): unexpected magic $(magic "$out")"; return 1; }
+  if [ "$LINUX" -eq 1 ]; then
+    [ "$(cx scanservjs stat -c %u "/var/lib/scanservjs/output/$name" 2>/dev/null | tr -d '\r')" = "1000" ] || { note "scan ($1): file not owned by uid 1000"; return 1; }
+  fi
+}
+check "scan to PNG via REST, downloadable" scan_one "PNG" '^.PNG'
+check "scan to PDF via REST, downloadable" scan_one "PDF (JPG | @:pipeline.high-quality)" '^%PDF'
+check "scan files listed by the API" bash -c "curl -fsS '$SCAN/api/v1/files' | python3 -c 'import json,sys; sys.exit(0 if len(json.load(sys.stdin))>=2 else 1)'"
+
+# ── swis ─────────────────────────────────────────────────────────────────────
+echo; echo "swis:"
+check "swis UI answers"       curl -fs -o /dev/null "$SWIS/"
+docker cp "${P}-cups-1:/tmp/awkward.pdf" .test/out/awkward.pdf >/dev/null 2>&1 || true
+# swis stores uploads under its own timestamped name and prints by that name
+stored="$(curl -fsS -F "file=@.test/out/awkward.pdf" "$SWIS/upload" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("filename","") if d.get("returncode",1)==0 else "")' 2>/dev/null || true)"
+if [ -n "$stored" ]; then
+  ok "swis accepts an upload (stored as $stored)"
+  before="$after"
+  pbody="$(python3 -c 'import json,sys; print(json.dumps({"filename":sys.argv[1],"quality":"4","orientation":"3","sides":"one-sided","pages":""}))' "$stored")"
+  if curl -fsS -H 'content-type: application/json' -d "$pbody" "$SWIS/print/execute" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("code", d.get("returncode", 1))==0 else 1)' 2>/dev/null; then
+    for ((i = 0; i < 60; i += 3)); do drained && break; sleep 3; done
+    after="$(cx ippeve sh -c 'ls -1 /spool 2>/dev/null | wc -l' | tr -d ' ')"
+    check "swis upload printed through the raster queue" test "$after" -gt "$before"
+    if [ "$LINUX" -eq 1 ]; then
+      check "swis upload is owned by uid 1000" bash -c "test \"\$($(printf '%q ' "${DC[@]}") exec -T swis stat -c %u /srv/scans/swis/$stored | tr -d '\\r')\" = 1000"
+    else
+      skp "file ownership (uid 1000) — Docker Desktop virtualizes bind-mount ownership; verified on Linux (kora VM / the Pi)"
+    fi
+  else
+    wrn "swis /print/execute rejected the request (third-party API; lp path proven above)"
+  fi
+else
+  wrn "swis /upload rejected the file (third-party API)"
+fi
+
+# ── exporter ─────────────────────────────────────────────────────────────────
+echo; echo "Exporter:"
+metrics="$(curl -fsS "$EXP/metrics" 2>/dev/null || true)"
+check "cups_up 1"                     bash -c "echo \"\$0\" | grep -qx 'cups_up 1.0'" "$metrics"
+check "printer state idle/processing (3|4)" bash -c "echo \"\$0\" | grep -Eq 'cups_printer_state\{printer=\"$Q\"\} [34].0'" "$metrics"
+check "virtual device state exported" bash -c "echo \"\$0\" | grep -q 'printer_device_state{printer=\"device\"} [345].0'" "$metrics"
+
+echo; echo "== Summary ==  Pass: $PASS  Fail: $FAIL  Warn: $WARN  Skip: $SKIP"
+if [ "$FAIL" -eq 0 ]; then echo "[test] PASS"; else echo "[test] FAIL"; exit 1; fi

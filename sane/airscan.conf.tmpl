@@ -1,0 +1,8 @@
+# cn-printer: sane-airscan — static eSCL entry for the Brother reached through
+# ipp-usb on the host (compose bridge gateway). Discovery is off so the same
+# device is never listed twice and no mDNS is needed inside the netns.
+[devices]
+"Brother MFC-L2750DW" = @PRINTER_ESCL_URL@, eSCL
+
+[options]
+discovery = disable

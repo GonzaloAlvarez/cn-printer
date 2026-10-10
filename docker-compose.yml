@@ -1,0 +1,231 @@
+# cn-printer — USB print + scan server for the Brother MFC-L2750DW on printer.lan.
+#
+# Shape (homelab "sidecar stack" archetype, like passwords.lan): the tailscale
+# sidecar ts-printer owns the netns; cups, scanservjs and swis join it, so one
+# identity serves the tailnet and the sidecar's published ports serve the LAN.
+# The printer is reached through ipp-usb on the HOST (amun printer), which
+# listens on :60000 on every interface; from this netns that is the compose
+# bridge gateway 172.30.6.1 (pinned IPAM below). Host-network exporters report
+# to kaiser (dual-exporter pattern).
+#
+# Never a usb:// queue: ipp-usb owns the USB interface; CUPS and the scanner
+# both go through it.
+services:
+  ts-printer:
+    image: tailscale/tailscale:latest
+    hostname: ts-printer
+    cap_add: ["NET_ADMIN", "SYS_MODULE"]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ts_state:/var/lib/tailscale
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${PRINTER_AUTHKEY}
+      - TS_HOSTNAME=printer
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+    # LAN access: Docker DNAT (bypasses ufw). The tailnet reaches the same
+    # ports on the sidecar's tailscale address directly.
+    ports:
+      - "631:631"     # cups (IPP + web UI)
+      - "8080:8080"   # scanservjs
+      - "5520:5520"   # swis
+    networks:
+      default:
+        ipv4_address: 172.30.6.10
+    restart: unless-stopped
+
+  # cupsd — own trixie image, driverless IPP over ipp-usb, raster-only PPD.
+  # DNS-SD (AirPrint) is published through the HOST avahi over its D-Bus
+  # socket; the record points at this host's :631 == the sidecar's port.
+  cups:
+    build: ./cups
+    image: cn-printer-cups:local
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer]
+    environment:
+      - PRINTER_DEVICE_URI=${PRINTER_DEVICE_URI}
+      - PRINTER_QUEUE=${PRINTER_QUEUE}
+      - PRINTER_DESCRIPTION=${PRINTER_DESCRIPTION}
+      - PRINTER_LOCATION=${PRINTER_LOCATION}
+      - PRINTER_KEEP_FORMATS=${PRINTER_KEEP_FORMATS}
+      - CUPS_ADMIN_USER=${CUPS_ADMIN_USER}
+      - CUPS_ADMIN_PASSWORD=${CUPS_ADMIN_PASSWORD}
+      - CUPS_ALLOW=${CUPS_ALLOW}
+      - CUPS_BROWSING=On
+      - TZ=${TIMEZONE}
+    volumes:
+      - cups_etc:/etc/cups
+      - ${CUPS_LOG_DIR}:/var/log/cups
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # local build
+    restart: unless-stopped
+
+  # scanservjs — scan UI (:8080). Static airscan.conf (rendered by setup.sh)
+  # instead of the image's AIRSCAN_DEVICES env, whose entrypoint appends a
+  # duplicate [devices] line on every restart. Output lands in the shared
+  # /srv/scans tree as uid 1000 so Samba/Stirling see gonzalo-owned files.
+  # One-shot: the named data volume inherits root ownership from the image;
+  # hand it to uid 1000 so scanservjs can run unprivileged. The name matches
+  # amun-docker reconcile's SKIP_RE (…-init) so it is never restart-looped.
+  scanservjs-init:
+    image: alpine:3.20
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /var/lib/scanservjs/preview /var/lib/scanservjs/temp /var/lib/scanservjs/thumbnails /var/lib/scanservjs/output && chown -R ${SCANS_UID}:${SCANS_GID} /var/lib/scanservjs"]
+    volumes:
+      - scanservjs_data:/var/lib/scanservjs
+    restart: "no"
+
+  scanservjs:
+    image: sbs20/scanservjs:v3.3.0
+    network_mode: "service:ts-printer"
+    depends_on:
+      ts-printer:
+        condition: service_started
+      scanservjs-init:
+        condition: service_completed_successfully
+    user: "${SCANS_UID}:${SCANS_GID}"
+    environment:
+      - TZ=${TIMEZONE}
+      # NOTE: do not set SCANIMAGE_LIST_IGNORE (even empty) — its mere presence
+      # disables `scanimage -L` discovery and the device list stays empty.
+    volumes:
+      - ./sane/airscan.conf:/etc/sane.d/airscan.conf:ro
+      - ./scanservjs/config.local.js:/etc/scanservjs/config.local.js:ro
+      - scanservjs_data:/var/lib/scanservjs
+      - ${SCANS_DIR}:/var/lib/scanservjs/output
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8080/api/v1/system',r=>process.exit(r.statusCode==200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  # swis — second UI (:5520): scan + upload-to-print (lp to the CUPS default
+  # queue inside the same netns). Own image on Python 3.12 (see swis/Dockerfile).
+  swis:
+    build: ./swis
+    image: cn-printer-swis:local
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer, cups]
+    environment:
+      - CUPS_SERVER=localhost:631
+      - SWIS_PUBLIC_HOST=${SWIS_PUBLIC_HOST}
+      - SWIS_PORT=5520
+      - SWIS_DESTINATION=/srv/scans/swis
+      - SWIS_UID=${SCANS_UID}
+      - SWIS_GID=${SCANS_GID}
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./sane/airscan.conf:/etc/sane.d/airscan.conf:ro
+      - ${SCANS_DIR}:/srv/scans
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # local build
+    restart: unless-stopped
+
+  # ── LAN-side observability for kaiser (cn-observability) ─────────────────
+  # Host network so kaiser scrapes 10.2.0.30:9100 / :9329 (ufw holes from
+  # amun printer). The textfile dir carries resilience_* (amun-docker) and
+  # rpi.prom (amun printer: under-voltage / throttling / SoC temperature).
+  node-exporter-lan:
+    image: prom/node-exporter:latest
+    network_mode: host
+    pid: host
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--web.listen-address=:9100"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
+    restart: unless-stopped
+
+  # cups-exporter — queue + device metrics on :9329 (host network; talks to the
+  # published :631 on loopback and to ipp-usb on :60000 for device attributes).
+  cups-exporter:
+    build: ./cups-exporter
+    image: cn-printer-cups-exporter:local
+    network_mode: host
+    environment:
+      - CUPS_SERVER=127.0.0.1:631
+      - PRINTER_IPP_URI=${PRINTER_DEVICE_URI}
+      - EXPORTER_PORT=9329
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # local build
+    restart: unless-stopped
+
+  promtail-lan:
+    image: grafana/promtail:3.4.2
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - /run/systemd/journal:/run/systemd/journal:ro
+      - ${CUPS_LOG_DIR}:/var/log/cups:ro
+      - promtail_positions:/tmp
+    restart: unless-stopped
+
+  # Host-wide auto-update (one Watchtower per host). Local builds opt out via
+  # the label above; sbs20/scanservjs is pinned to a tag on purpose — bump it
+  # by hand after reading its release notes (pipeline/config.local.js API).
+  watchtower:
+    image: containrrr/watchtower:latest
+    command:
+      - "--cleanup"
+      - "--schedule=0 0 4 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.45
+    restart: unless-stopped
+
+  # offen — weekly tar of the scan tree + CUPS config to shared S3 + raidnas
+  # WebDAV. Window Sun 01:30 (dnsdhcpd 02:00, vaultwarden/fitness 03:00).
+  backup:
+    image: offen/docker-volume-backup:v2.43.4
+    environment:
+      - BACKUP_CRON_EXPRESSION=30 1 * * 0
+      - BACKUP_FILENAME=printer-%Y-%m-%dT%H-%M-%S.tar.gz
+      - BACKUP_RETENTION_DAYS=56
+      - AWS_S3_BUCKET_NAME=${BACKUP_S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${BACKUP_AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${BACKUP_AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_REGION=${BACKUP_AWS_REGION}
+      - AWS_S3_PATH=printer/
+      - WEBDAV_URL=${BACKUP_WEBDAV_URL}
+      - WEBDAV_PATH=/printer/
+      - WEBDAV_USERNAME=${BACKUP_WEBDAV_USER}
+      - WEBDAV_PASSWORD=${BACKUP_WEBDAV_PASSWORD}
+      - NOTIFICATION_URLS=smtp://${SMTP_USERNAME}:${SMTP_PASSWORD}@${SMTP_HOST}:${SMTP_PORT}/?from=${SMTP_FROM}&to=${ALERT_EMAIL}&starttls=yes
+      - NOTIFICATION_LEVEL=info
+      - TZ=${TIMEZONE}
+    volumes:
+      - ${SCANS_DIR}:/backup/scans:ro
+      - cups_etc:/backup/cups-etc:ro
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.6.0/24
+          gateway: 172.30.6.1
+
+volumes:
+  ts_state:
+  cups_etc:
+  scanservjs_data:
+  promtail_positions:
