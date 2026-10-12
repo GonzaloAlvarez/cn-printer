@@ -41,7 +41,7 @@ done
 [[ -n "$(env_get CUPS_ADMIN_PASSWORD)" ]] || warn "CUPS_ADMIN_PASSWORD is empty — the :631 admin pages will have no login"
 
 # ── host contracts (amun printer) ───────────────────────────────────────────
-for d in "$SCANS_DIR" "$SCANS_DIR/swis" "$SCANS_DIR/inbox" "$SCANS_DIR/processed"; do
+for d in "$SCANS_DIR" "$SCANS_DIR/inbox" "$SCANS_DIR/processed"; do
   [[ -d "$d" ]] || die "$d missing — run: amun printer"
 done
 [[ "$(stat -c %u "$SCANS_DIR")" == "$SCANS_UID" ]] || warn "$SCANS_DIR is owned by uid $(stat -c %u "$SCANS_DIR"), .env says SCANS_UID=$SCANS_UID"
@@ -100,7 +100,7 @@ for i in $(seq 1 12); do
 done
 
 log "listeners"
-ss -ltn 2>/dev/null | grep -E ':(80|443|631|8080|5520|9100|9329) ' || true
+ss -ltn 2>/dev/null | grep -E ':(80|443|631|8080|9100|9329) ' || true
 
 log "queue"
 docker compose exec -T cups lpstat -v 2>/dev/null || warn "no queue yet (printer off?) — the cups container retries every 60s"
@@ -113,7 +113,6 @@ cn-printer is up.
 
   Print (CUPS)   :  http://printer.lan:631      (AirPrint/IPP Everywhere on the LAN)
   Scan           :  https://${SCAN_LAN_HOST}     (scanservjs via traefik-lan, step-ca; also http://printer.lan:8080)
-  Scan + upload  :  http://printer.lan:5520     (swis)
   Google Drive   :  $( [[ -f rclone/rclone.conf ]] && echo "enabled → $(env_get GDRIVE_REMOTE_PATH)" || echo "disabled (no rclone/rclone.conf)" )
   Tailnet        :  same ports on printer.ts.gn.al
   Metrics        :  :9100 node-exporter, :9329 cups-exporter (kaiser scrapes)

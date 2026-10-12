@@ -179,7 +179,6 @@ def cups_dashboard():
     y += 4
     p.append(stat(9, "CUPS web/IPP :631", [q('probe_success{instance="http://printer.lan:631/"}')], 0, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(10, "Scan UI scan.print.lan", [q('probe_success{instance="https://scan.print.lan/api/v1/system"}')], 4, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
-    p.append(stat(11, "swis :5520", [q('probe_success{instance="http://printer.lan:5520/app/"}')], 8, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(12, "cups-exporter scrape", [q('up{job="printer-cups"}')], 12, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(13, "Device state (ipp-usb)", [q(f'printer_device_state{{{H},printer="device"}}')], 16, y, 4, 4, color_mode="background",
                   mappings=[{"type": "value", "options": {"0": {"text": "unreachable", "color": "red"}, "3": {"text": "idle", "color": "green"}, "4": {"text": "printing", "color": "blue"}, "5": {"text": "stopped", "color": "red"}}}],
@@ -202,7 +201,7 @@ def cups_dashboard():
     p.append(logs(34, "cupsd error_log (warnings and errors)", '{job="cups-error-log"} |~ "^[EW] "', 12, y, 12, 9))
     y += 9
     p.append(row(40, "Containers", y)); y += 1
-    p.append(logs(41, "cn-printer containers", '{stack="cn-printer", service=~"cups|scanservjs|swis|cups-exporter|ts-printer"}', 0, y, 24, 9))
+    p.append(logs(41, "cn-printer containers", '{stack="cn-printer", service=~"cups|scanservjs|cups-exporter|ts-printer|traefik-lan"}', 0, y, 24, 9))
     return dashboard("cups", "CUPS print server (cn-printer)", ["printer", "cn-printer", "cups", "homelab"], p, time_from="now-24h")
 
 

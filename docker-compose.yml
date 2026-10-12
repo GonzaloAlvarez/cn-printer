@@ -1,7 +1,7 @@
 # cn-printer — USB print + scan server for the Brother MFC-L2750DW on printer.lan.
 #
 # Shape (homelab "sidecar stack" archetype, like passwords.lan): the tailscale
-# sidecar ts-printer owns the netns; cups, scanservjs and swis join it, so one
+# sidecar ts-printer owns the netns; cups and scanservjs join it, so one
 # identity serves the tailnet and the sidecar's published ports serve the LAN.
 # The printer is reached through ipp-usb on the HOST (amun printer), which
 # listens on :60000 on every interface; from this netns that is the compose
@@ -33,7 +33,6 @@ services:
     ports:
       - "631:631"     # cups (IPP + web UI)
       - "8080:8080"   # scanservjs
-      - "5520:5520"   # swis
     networks:
       default:
         ipv4_address: 172.30.6.10
@@ -126,28 +125,6 @@ services:
       com.centurylinklabs.watchtower.enable: "false"   # local build (pinned upstream tag inside)
     restart: unless-stopped
 
-  # swis — second UI (:5520): scan + upload-to-print (lp to the CUPS default
-  # queue inside the same netns). Own image on Python 3.12 (see swis/Dockerfile).
-  swis:
-    build: ./swis
-    image: cn-printer-swis:local
-    network_mode: "service:ts-printer"
-    depends_on: [ts-printer, cups]
-    environment:
-      - CUPS_SERVER=localhost:631
-      - SWIS_PUBLIC_HOST=${SWIS_PUBLIC_HOST}
-      - SWIS_PORT=5520
-      - SWIS_DESTINATION=/srv/scans/swis
-      - SWIS_UID=${SCANS_UID}
-      - SWIS_GID=${SCANS_GID}
-      - TZ=${TIMEZONE}
-    volumes:
-      - ./sane/airscan.conf:/etc/sane.d/airscan.conf:ro
-      - ${SCANS_DIR}:/srv/scans
-    labels:
-      com.centurylinklabs.watchtower.enable: "false"   # local build
-    restart: unless-stopped
-
   # ── LAN edge: https://scan.print.lan → scanservjs ─────────────────────────
   # Host network like cn-nvr's traefik-lan: it owns the Pi's 80/443 (ufw holes
   # from amun printer — host-network listeners do not bypass ufw) and reaches
@@ -231,7 +208,7 @@ services:
       - promtail_positions:/tmp
     restart: unless-stopped
 
-  # Host-wide auto-update (one Watchtower per host). Local builds (cups, swis,
+  # Host-wide auto-update (one Watchtower per host). Local builds (cups,
   # scanservjs, cups-exporter) opt out via their labels; scanservjs's upstream
   # tag and rclone are pinned in scanservjs/Dockerfile on purpose — bump them
   # by hand after reading the release notes (pipeline/config.local.js API).

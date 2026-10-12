@@ -1,18 +1,19 @@
 # cn-printer
 
-USB print + scan server for the **Brother MFC-L2750DW** on `printer.lan` (Raspberry Pi 4, WiFi, OS on a USB SSD). A Docker Compose stack in the homelab "sidecar" shape: a Tailscale sidecar owns the network namespace, CUPS and the two scan UIs join it, a host-network Traefik serves the scan UI as **`https://scan.print.lan`** with a step-ca certificate, and host-network exporters report to kaiser. Scans default to **PDF** (searchable-PDF variants via tesseract) and can go **straight to Google Drive**.
+USB print + scan server for the **Brother MFC-L2750DW** on `printer.lan` (Raspberry Pi 4, WiFi, OS on a USB SSD). A Docker Compose stack in the homelab "sidecar" shape: a Tailscale sidecar owns the network namespace, CUPS and scanservjs join it, a host-network Traefik serves the scan UI as **`https://scan.print.lan`** with a step-ca certificate, and host-network exporters report to kaiser. Scans default to **PDF** (searchable-PDF variants via tesseract) and can go **straight to Google Drive**.
 
 Companion host plugin: [amun-printer](https://github.com/GonzaloAlvarez/amun-printer) (ipp-usb on the host, usblp blacklist, persistent journal, watchdog, memory cgroup, `/srv/scans`, ufw holes incl. 80/443).
+
+One scan UI on purpose: swis (a second scan + browser-upload-to-print UI) was removed on 2026-10-12 — every device prints through the AirPrint/IPP queue directly, and scanservjs covers scanning, PDF, OCR and Drive.
 
 ```
 printer.lan (host)   ipp-usb :60000 on all interfaces (IPP + eSCL)   avahi-daemon   ufw: 22 · 80/443 · 9100/9329←kaiser · 60000←bridges
 ├─ traefik-lan (host net) :80 → :443   https://scan.print.lan → 127.0.0.1:8080   step-ca ACME (HTTP-01 via pfSense)
 └─ cn-printer (bridge 172.30.6.0/24, gateway 172.30.6.1)
-   ts-printer   tailscale sidecar `printer` (tag:svc); publishes 631 8080 5520 on the LAN
+   ts-printer   tailscale sidecar `printer` (tag:svc); publishes 631 8080 on the LAN
    ├─ cups      own trixie image · queue Brother_MFC-L2750DW → ipp://172.30.6.1:60000/ipp/print · raster-only PPD
-   ├─ scanservjs  own image (sbs20/scanservjs:v3.3.0 + rclone) · eSCL via sane-airscan → http://172.30.6.1:60000/eSCL
-   │             PDF-first pipelines · OCR (tesseract) · "→ Google Drive" pipelines + Files-tab action · output /srv/scans
-   └─ swis      own image · scan + upload-to-print (lp → CUPS default queue) · output /srv/scans/swis
+   └─ scanservjs  own image (sbs20/scanservjs:v3.3.0 + rclone) · eSCL via sane-airscan → http://172.30.6.1:60000/eSCL
+                 PDF-first pipelines · OCR (tesseract) · "→ Google Drive" pipelines + Files-tab action · output /srv/scans
    node-exporter-lan :9100 · cups-exporter :9329 · promtail-lan → kaiser Loki · watchtower · backup (offen)
 ```
 
@@ -24,7 +25,6 @@ printer.lan (host)   ipp-usb :60000 on all interfaces (IPP + eSCL)   avahi-daemo
 - **The LAN edge is a host-network Traefik** (`traefik-lan`, the cn-nvr pattern): it owns the Pi's 80/443, redirects HTTP to HTTPS and routes `Host: scan.print.lan` to the port the sidecar publishes. Certificates come from step-ca over ACME HTTP-01, which pki validates **through pfSense** — so the name needs a Technitium record *and* a pfSense Host Override. It runs on the host network (not in the sidecar's namespace) so it can `extra_hosts` pki and survive sidecar restarts; ufw must admit 80/443 (amun-printer does).
 - **Loopback is per-netns.** The containers reach ipp-usb on the compose bridge gateway `172.30.6.1`, so the host plugin runs ipp-usb with `interface = all` and ufw admits `:60000` only from `172.16.0.0/12`.
 - **scanservjs is our own image on the upstream tag.** `scanservjs/Dockerfile` adds a pinned rclone (GitHub release, checksum-verified; trixie's apt rclone is the 2022 1.60 line) to `sbs20/scanservjs:v3.3.0`, which already ships tesseract 5.5 with `eng`/`spa`/… data. `scanservjs/config.local.js` makes "PDF (JPG | high-quality)" the default pipeline, keeps the OCR pipelines, adds two "→ Google Drive" pipelines (automatic upload when the scan finishes) and a Files-tab action "Upload to Google Drive". The Drive remote is an OAuth client with the **`drive.file`** scope only: a leaked token could touch files rclone created, nothing else.
-- **swis on Python 3.12 with uvicorn 0.29.** swis 0.6.1 pins pydantic 1.x and `websockets~=9.1` but lets uvicorn float to 0.54, whose websockets integration needs websockets ≥ 13 and crashes at start; the image pins uvicorn 0.29.0 and sidesteps trixie's Python 3.13. swis has no device/queue selection: it scans the SANE **default** device (the one static airscan entry) and prints to the CUPS **default** queue (the helper sets it).
 - **One Watchtower per host**, local builds opted out; the scanservjs upstream tag and rclone are pinned in `scanservjs/Dockerfile` on purpose (its `config.local.js` API changes between majors).
 
 ## Install (printer.lan)
@@ -51,7 +51,6 @@ Names (once): `scan.print.lan → 10.2.0.30` in `cn-dnsdhcpd/dns/records.tsv` (`
 |---|---|---|
 | Scan (scanservjs) | **`https://scan.print.lan`** (step-ca) · `http://printer.lan:8080` | `http://printer.ts.gn.al:8080` |
 | Print (CUPS web UI, IPP) | `http://printer.lan:631` · `ipp://printer.lan:631/printers/Brother_MFC-L2750DW` | `http://printer.ts.gn.al:631` |
-| Scan + upload-to-print (swis) | `http://printer.lan:5520` | same port (its front-end calls `printer.lan`, see gotchas) |
 | Metrics (kaiser scrapes) | `10.2.0.30:9100`, `10.2.0.30:9329` | — |
 
 Printing needs no login. The `:631` admin pages ask for `CUPS_ADMIN_USER` / `CUPS_ADMIN_PASSWORD`. AirPrint/Mopria discovery works on the WiFi VLAN only (mDNS does not cross VLANs or the tailnet); elsewhere add the printer by URL. `scan.print.lan` resolves on the LAN only.
@@ -86,7 +85,7 @@ Trigger a backup by hand: `docker compose exec backup /usr/bin/backup`.
 
 ## Observability (kaiser, cn-observability)
 
-- Prometheus jobs `printer-node` (`:9100`, `host=printer`) and `printer-cups` (`:9329`, `stack=cn-printer`); blackbox `blackbox-https` probes `https://scan.print.lan/api/v1/system`, `blackbox-http` probes `:631/` and `:5520/app/`.
+- Prometheus jobs `printer-node` (`:9100`, `host=printer`) and `printer-cups` (`:9329`, `stack=cn-printer`); blackbox `blackbox-https` probes `https://scan.print.lan/api/v1/system`, `blackbox-http` probes `:631/`.
 - Dashboards `printer-overview` (host: CPU/mem/disk/net + SoC temperature + under-voltage/throttle from `rpi.prom`) and `cups` (queue state, jobs, state reasons, toner, probes, pages per day/user from `page_log` in Loki). Generated by `grafana/build-dashboards.py` — edit the generator, not the JSON.
 - Alerts: `PiUndervoltage`, `PiThrottled`, `CupsExporterDown`, `PrinterStopped`, `PrinterNeedsAttention`, `TonerLow`, `PrintQueueStuck`, plus the generic host group.
 - promtail ships container logs (incl. `[gdrive] uploaded/FAILED` lines from scanservjs and Traefik's ACME log), the journal and CUPS `page_log`/`error_log` (`CUPS_LOG_DIR` bind) to `10.1.1.140:3100`; kaiser's ufw must admit `10.2.0.30` on 3100.
@@ -95,24 +94,24 @@ Deliberate omissions: no Consul/traefik-lab route (plain HTTP on the tailnet by 
 
 ## Testing
 
-`./test` builds the four local images and brings the stack up with **virtual devices** — `ippeveprinter` from `cups/Dockerfile.ippeve` (a fake IPP Everywhere printer that advertises PDF *and* raster, so the test proves CUPS still sends raster; it carries its own D-Bus + avahi because CUPS 2.4's ippeveprinter initialises DNS-SD even with `-r off`), the SANE `test` backend (a synthetic colour flatbed scanservjs lists as `test:0`), an rclone `local` remote standing in for Google Drive (`.test/drive-out`), and traefik-lan inside the netns on plain HTTP — on loopback ports `16310/18080/15520/19329/18081` (a Mac's own cupsd keeps `:631`). It then proves:
+`./test` builds the three local images and brings the stack up with **virtual devices** — `ippeveprinter` from `cups/Dockerfile.ippeve` (a fake IPP Everywhere printer that advertises PDF *and* raster, so the test proves CUPS still sends raster; it carries its own D-Bus + avahi because CUPS 2.4's ippeveprinter initialises DNS-SD even with `-r off`), the SANE `test` backend (a synthetic colour flatbed scanservjs lists as `test:0`), an rclone `local` remote standing in for Google Drive (`.test/drive-out`), and traefik-lan inside the netns on plain HTTP — on loopback ports `16310/18080/19329/18081` (a Mac's own cupsd keeps `:631`). It then proves:
 
 - queue created on the virtual printer, default, shared; `printer-queue-setup` re-run prints `UNCHANGED`; the PPD keeps `image/pwg-raster|urf` and has **no** `application/pdf`/`image/jpeg` passthrough;
 - `lp` of a two-page PDF → the spooled document is PWG/URF raster (`EVIDENCE: print → …`);
 - scanservjs REST scan to PNG, PDF and **OCR PDF**, downloaded and type-checked; **PDF is the default pipeline**;
 - `PDF → Google Drive` lands the file on the stand-in remote with no `.gdrive-FAILED` marker; the Files-tab action uploads an existing scan; the action without `rclone.conf` fails with HTTP 500 and the server stays up;
 - traefik-lan routes `Host: scan.print.lan` to scanservjs and 404s an unknown host;
-- swis up, upload (stored under swis's timestamped name) + `/print/execute` lands a second raster job; file ownership uid 1000 (Linux only);
+- scans are owned by uid 1000 (Linux only; Docker Desktop virtualizes bind-mount ownership);
 - cups-exporter reports `cups_up 1`, printer idle, device state.
 
 ```bash
 ./test            # on the Mac (Docker Desktop) or any Linux Docker host
-./test --keep     # leave the stack up: http://127.0.0.1:18080 (scan UI), :16310 (CUPS), :15520 (swis), :18081 (edge, send Host: scan.print.lan)
+./test --keep     # leave the stack up: http://127.0.0.1:18080 (scan UI), :16310 (CUPS), :18081 (edge, send Host: scan.print.lan)
 ```
 
 On macOS Docker Desktop a long scan request is occasionally dropped by the port forwarder; the scan step retries once (a real failure still fails both attempts). Linux runs (kora VM, rpid11, the Pi) have never shown it.
 
-Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --post tests/vm-e2e.sh`), after `amun`, `amun docker` and `amun printer` have converged. Static checks: `docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test config --quiet`, `shellcheck cups/* swis/entrypoint.sh setup.sh test scripts/*.sh`, `node --check scanservjs/config.local.js`, `python3 -m py_compile cups-exporter/exporter.py`.
+Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --post tests/vm-e2e.sh`), after `amun`, `amun docker` and `amun printer` have converged. Static checks: `docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test config --quiet`, `shellcheck cups/* setup.sh test scripts/*.sh`, `node --check scanservjs/config.local.js`, `python3 -m py_compile cups-exporter/exporter.py`.
 
 ## Gotchas
 
@@ -124,8 +123,7 @@ Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --pos
 - **scanservjs runs the pipeline `afterAction` without awaiting it**: a rejecting action would be an unhandled promise rejection and kill the server. That is why the pipelines use the "(background)" action, which catches and writes the `.gdrive-FAILED.txt` marker, while the Files-tab action throws so the UI can show the error.
 - **`rclone/rclone.conf` is mounted read-write on purpose** and must be readable by uid 1000 (`kauket get` as gonzalo gives exactly that): rclone rewrites the `token` line when it refreshes the access token. The refresh token itself does not change, so the Kauket copy stays valid; re-mint only if Google revokes it (7-day expiry = the OAuth app was left "in testing").
 - **`rclone authorize` wants its JSON blob in URL-safe, unpadded base64** — standard base64 fails with `decode simple map: illegal base64 data`. `scripts/gdrive-auth.sh` does this right; the blob is what lets us request `drive.file` instead of full `drive`.
-- **swis front-end host** is baked into its `config.json` as `SWIS_PUBLIC_HOST` (`printer.lan`). From the tailnet the page loads but its API calls go to `printer.lan`; use scanservjs there, or map `printer.lan` locally.
-- **scanservjs and swis run as uid 1000** so scans and uploads land as `gonzalo` for the future Samba share and Stirling-PDF (`/srv/scans/inbox` as a watched folder). `scanservjs-init` (a one-shot, named to match amun-docker's reconcile skip list) hands the data volume to that uid; swis writes its front-end config as root and drops privileges with `setpriv`. On Docker Desktop (macOS) bind-mount ownership is virtualized, so `./test` only asserts ownership on Linux.
+- **scanservjs runs as uid 1000** so scans land as `gonzalo` for the future Samba share and Stirling-PDF (`/srv/scans/inbox` as a watched folder). `scanservjs-init` (a one-shot, named to match amun-docker's reconcile skip list) hands the data volume to that uid. On Docker Desktop (macOS) bind-mount ownership is virtualized, so `./test` only asserts ownership on Linux.
 - **The printer may be off at boot**: cups starts anyway (healthcheck is the web UI, not the queue) and retries the queue every 60 s; `lpstat -v` empty until then.
 - **AirPrint record**: `/etc/avahi/services/cn-printer-Brother_MFC-L2750DW.service` on the host, written by the cups entrypoint once the queue exists (`PRINTER_ADVERTISE_NAME`/`_HOST` in `.env`). If `dns-sd -B _ipp._tcp,_universal local.` on a Mac shows nothing, check `avahi-daemon` on the host and that `/etc/avahi/services` is bind-mounted; a Mac that still sees `dnssd://…/cups` is showing a cached record (`sudo killall -HUP mDNSResponder`).
 - **Pi 4 power**: the SSD and the printer share the Pi's 1.2 A USB budget; under-voltage shows up as `rpi_undervoltage_*` on kaiser. Use the official 5.1 V / 3 A supply and a powered hub for the SSD.

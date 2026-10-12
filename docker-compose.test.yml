@@ -19,7 +19,6 @@ services:
     ports: !override
       - "127.0.0.1:16310:631"    # cups
       - "127.0.0.1:18080:8080"   # scanservjs
-      - "127.0.0.1:15520:5520"   # swis
       - "127.0.0.1:19329:9329"   # cups-exporter (joins the netns in test)
       - "127.0.0.1:18081:18081"  # traefik-lan (joins the netns in test; plain HTTP)
 
@@ -74,16 +73,6 @@ services:
     extra_hosts: !reset []
     volumes: !override
       - ./traefik-lan/dynamic.test.yml:/etc/traefik/dynamic.yml:ro
-
-  swis:
-    environment:
-      - SWIS_PUBLIC_HOST=localhost
-      - SWIS_PORT=5520
-    volumes: !override
-      - ./.test/airscan.conf:/etc/sane.d/airscan.conf:ro
-      - ./sane/dll.conf:/etc/sane.d/dll.conf:ro
-      - ./sane/test.conf:/etc/sane.d/test.conf:ro
-      - ${SCANS_DIR}:/srv/scans
 
   cups-exporter:
     network_mode: "service:ts-printer"

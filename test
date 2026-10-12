@@ -3,8 +3,8 @@
 # user journeys end to end, anywhere Docker runs (the Mac, a kora VM, rpid11):
 #   print: lp → CUPS raster-only queue → ippeveprinter spool holds PWG/URF raster, never PDF
 #   scan : scanservjs REST on the SANE `test` device → downloadable PNG and PDF
-#   swis : UI up, upload + print → a second raster job
 #   edge : traefik-lan routes Host: scan.print.lan to scanservjs
+#   files: scans land as uid 1000 (Linux only; Docker Desktop virtualizes ownership)
 #   drive: PDF is the default pipeline; OCR PDF works; "→ Google Drive" pipeline
 #          and the Files-tab action land the file on the rclone remote (a local
 #          stand-in in test)
@@ -25,7 +25,7 @@ done
 
 P=cn-printer-test
 DC=(docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test -p "$P")
-CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; SWIS=http://127.0.0.1:15520; EXP=http://127.0.0.1:19329; EDGE=http://127.0.0.1:18081
+CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; EXP=http://127.0.0.1:19329; EDGE=http://127.0.0.1:18081
 Q=Brother_MFC-L2750DW
 PASS=0; FAIL=0; WARN=0; SKIP=0
 LINUX=0; [ "$(uname -s)" = Linux ] && LINUX=1   # bind-mount ownership is only meaningful on Linux (Docker Desktop virtualizes it)
@@ -48,8 +48,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cn-printer test =="
-mkdir -p .test/scans/swis .test/cups-log .test/rclone .test/drive-out
-chmod 0777 .test/scans .test/scans/swis .test/cups-log .test/rclone .test/drive-out   # containers write/rename as uid 1000 / root
+mkdir -p .test/scans .test/cups-log .test/rclone .test/drive-out
+chmod 0777 .test/scans .test/cups-log .test/rclone .test/drive-out   # containers write/rename as uid 1000 / root
 printf '[options]\ndiscovery = disable\n' > .test/airscan.conf    # no real scanner in test
 printf '[gdrive]\ntype = local\n' > .test/rclone/rclone.conf       # Google Drive stand-in: rclone local remote
 rm -f .test/drive-out/* 2>/dev/null || true
@@ -70,7 +70,6 @@ wait_healthy() { # name timeout
 check "cups healthy"          wait_healthy cups 180
 check "cups web UI answers on the published port" curl -fs -o /dev/null "$CUPS/"
 check "scanservjs healthy"    wait_healthy scanservjs 180
-check "swis healthy"          wait_healthy swis 180
 check "cups-exporter healthy" wait_healthy cups-exporter 120
 
 # ── print path ───────────────────────────────────────────────────────────────
@@ -172,32 +171,6 @@ echo; echo "Edge:"
 check "traefik-lan routes Host: scan.print.lan to scanservjs" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Host: scan.print.lan' '$EDGE/api/v1/system')\" = 200 ]"
 check "traefik-lan serves the scan UI root"                   bash -c "curl -fsS -m 10 -H 'Host: scan.print.lan' '$EDGE/' | grep -qi '<html'"
 check "traefik-lan answers 404 for an unknown host"           bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Host: nothing.example' '$EDGE/')\" = 404 ]"
-
-# ── swis ─────────────────────────────────────────────────────────────────────
-echo; echo "swis:"
-check "swis UI answers"       curl -fs -o /dev/null "$SWIS/"
-docker cp "${P}-cups-1:/tmp/awkward.pdf" .test/out/awkward.pdf >/dev/null 2>&1 || true
-# swis stores uploads under its own timestamped name and prints by that name
-stored="$(curl -fsS -F "file=@.test/out/awkward.pdf" "$SWIS/upload" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("filename","") if d.get("returncode",1)==0 else "")' 2>/dev/null || true)"
-if [ -n "$stored" ]; then
-  ok "swis accepts an upload (stored as $stored)"
-  before="$after"
-  pbody="$(python3 -c 'import json,sys; print(json.dumps({"filename":sys.argv[1],"quality":"4","orientation":"3","sides":"one-sided","pages":""}))' "$stored")"
-  if curl -fsS -H 'content-type: application/json' -d "$pbody" "$SWIS/print/execute" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("code", d.get("returncode", 1))==0 else 1)' 2>/dev/null; then
-    for ((i = 0; i < 60; i += 3)); do drained && break; sleep 3; done
-    after="$(cx ippeve sh -c 'ls -1 /spool 2>/dev/null | wc -l' | tr -d ' ')"
-    check "swis upload printed through the raster queue" test "$after" -gt "$before"
-    if [ "$LINUX" -eq 1 ]; then
-      check "swis upload is owned by uid 1000" bash -c "test \"\$($(printf '%q ' "${DC[@]}") exec -T swis stat -c %u /srv/scans/swis/$stored | tr -d '\\r')\" = 1000"
-    else
-      skp "file ownership (uid 1000) — Docker Desktop virtualizes bind-mount ownership; verified on Linux (kora VM / the Pi)"
-    fi
-  else
-    wrn "swis /print/execute rejected the request (third-party API; lp path proven above)"
-  fi
-else
-  wrn "swis /upload rejected the file (third-party API)"
-fi
 
 # ── exporter ─────────────────────────────────────────────────────────────────
 echo; echo "Exporter:"
