@@ -6,6 +6,8 @@
 #   * the SANE `test` backend stands in for the scanner (test:0)
 #   * traefik-lan joins the netns, plain HTTP on :18081, no step-ca
 #   * the Google Drive remote is an rclone `local` remote → ./.test/drive-out
+#   * ews: busybox httpd serving a captured Brother maintenance page on :8632
+#     (what cups-exporter scrapes through ipp-usb on the real host)
 #   * production-only services move behind the `prod` profile
 # Used by ./test: docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test
 services:
@@ -74,12 +76,26 @@ services:
     volumes: !override
       - ./traefik-lan/dynamic.test.yml:/etc/traefik/dynamic.yml:ro
 
+  # Stand-in for the Brother's embedded web server: the real one is proxied by
+  # ipp-usb at http://172.30.6.1:60000/; here busybox serves the fixture page
+  # (serial scrubbed) so the maintenance-page metrics are exercised end to end.
+  ews:
+    image: busybox:1.36          # alpine's busybox build has no httpd applet
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer]
+    command: ["httpd", "-f", "-p", "8632", "-h", "/www"]
+    volumes:
+      - ./cups-exporter/tests/fixtures/ews:/www:ro
+    restart: "no"
+
   cups-exporter:
     network_mode: "service:ts-printer"
-    depends_on: [ts-printer, cups]
+    depends_on: [ts-printer, cups, ews]
     environment:
       - CUPS_SERVER=localhost:631
       - PRINTER_IPP_URI=ipp://localhost:8631/ipp/print
+      - PRINTER_EWS_URL=http://localhost:8632
+      - PRINTER_EWS_INTERVAL=5
       - EXPORTER_PORT=9329
 
   node-exporter-lan:

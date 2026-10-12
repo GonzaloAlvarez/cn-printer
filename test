@@ -8,7 +8,8 @@
 #   drive: PDF is the default pipeline; OCR PDF works; "→ Google Drive" pipeline
 #          and the Files-tab action land the file on the rclone remote (a local
 #          stand-in in test)
-#   cups-exporter: cups_up 1, printer state idle
+#   cups-exporter: cups_up 1, printer state idle, Brother maintenance-page counters
+#          (parsed from a captured page served by a busybox stand-in)
 #   ./test [--in-vm] [--keep]      --keep leaves the stack up for inspection
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
@@ -55,6 +56,7 @@ printf '[gdrive]\ntype = local\n' > .test/rclone/rclone.conf       # Google Driv
 rm -f .test/drive-out/* 2>/dev/null || true
 
 check "compose config renders" "${DC[@]}" config --quiet
+check "brother_ews parser unit tests" python3 -m unittest discover -s cups-exporter/tests -q
 echo "[test] building images and starting the stack"
 "${DC[@]}" up -d --build --remove-orphans >/dev/null
 
@@ -178,6 +180,16 @@ metrics="$(curl -fsS "$EXP/metrics" 2>/dev/null || true)"
 check "cups_up 1"                     bash -c "echo \"\$0\" | grep -qx 'cups_up 1.0'" "$metrics"
 check "printer state idle/processing (3|4)" bash -c "echo \"\$0\" | grep -Eq 'cups_printer_state\{printer=\"$Q\"\} [34].0'" "$metrics"
 check "virtual device state exported" bash -c "echo \"\$0\" | grep -q 'printer_device_state{printer=\"device\"} [345].0'" "$metrics"
+for ((i = 0; i < 30; i += 3)); do echo "$metrics" | grep -q '^brother_ews_up 1.0' && break; sleep 3; metrics="$(curl -fsS "$EXP/metrics" 2>/dev/null || true)"; done
+check "brother_ews_up 1 (maintenance page parsed)"   bash -c "echo \"\$0\" | grep -qx 'brother_ews_up 1.0'" "$metrics"
+check "brother_pages_printed_total 1328"            bash -c "echo \"\$0\" | grep -qx 'brother_pages_printed_total 1328.0'" "$metrics"
+check "brother_pages_scanned_total 446"             bash -c "echo \"\$0\" | grep -qx 'brother_pages_scanned_total 446.0'" "$metrics"
+check "brother_drum_life_percent 89"                bash -c "echo \"\$0\" | grep -qx 'brother_drum_life_percent 89.0'" "$metrics"
+check "paper jams by location (adf_simplex 1)"      bash -c "echo \"\$0\" | grep -qx 'brother_paper_jams_total{location=\"adf_simplex\"} 1.0'" "$metrics"
+check "replacements (toner 1)"                      bash -c "echo \"\$0\" | grep -qx 'brother_replacements_total{part=\"toner\"} 1.0'" "$metrics"
+check "error history (1 = Jam Inside at page 1032)" bash -c "echo \"\$0\" | grep -qx 'brother_error_history{error=\"Jam Inside\",index=\"1\"} 1032.0'" "$metrics"
+check "duplex pages by function (total 556)"        bash -c "echo \"\$0\" | grep -qx 'brother_pages_printed_duplex_total{function=\"total\"} 556.0'" "$metrics"
+evidence "brother maintenance metrics: $(echo "$metrics" | grep -c '^brother_') series"
 
 echo; echo "== Summary ==  Pass: $PASS  Fail: $FAIL  Warn: $WARN  Skip: $SKIP"
 if [ "$FAIL" -eq 0 ]; then echo "[test] PASS"; else echo "[test] FAIL"; exit 1; fi

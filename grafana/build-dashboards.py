@@ -9,7 +9,7 @@ Outputs (committed into cn-observability's provisioning dir):
 
 Re-run after editing; keep uids stable (printer-overview, cups). Metric sources:
 node-exporter-lan (host=printer), amun-printer's rpi.prom textfile, cn-printer's
-cups-exporter (job=printer-cups), blackbox-http/https probes, promtail-lan (Loki).
+cups-exporter (job=printer-cups; CUPS, IPP device attributes and the Brother maintenance page), blackbox-http/https probes, promtail-lan (Loki).
 
     ./build-dashboards.py [path/to/cn-observability]   (default ../../cn-observability)
 """
@@ -193,6 +193,27 @@ def cups_dashboard():
     p.append(ts(24, "Toner / drum level", [q(f'printer_marker_level_percent{{{H}}}', "{{printer}} {{marker}}")], 12, y, 12, 7, unit="percent", min_=0, max_=100,
                 thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 10}]))
     y += 7
+    # ── Brother lifetime counters (cups-exporter scrapes the printer's public maintenance page) ──
+    p.append(row(50, "Printer lifetime (Brother maintenance page via ipp-usb)", y)); y += 1
+    p.append(stat(51, "Pages printed", [q(f'brother_pages_printed_total{{{H}}}')], 0, y, 3, 4, decimals=0))
+    p.append(stat(52, "Pages scanned", [q(f'brother_pages_scanned_total{{{H}}}')], 3, y, 3, 4, decimals=0))
+    p.append(stat(53, "Drum life", [q(f'brother_drum_life_percent{{{H}}}')], 6, y, 3, 4, unit="percent", decimals=0, color_mode="background",
+                  thresholds=[{"color": "red", "value": None}, {"color": "orange", "value": 10}, {"color": "green", "value": 25}]))
+    p.append(stat(54, "Toner life", [q(f'brother_toner_life_percent{{{H}}}')], 9, y, 3, 4, unit="percent", decimals=0, color_mode="background",
+                  thresholds=[{"color": "red", "value": None}, {"color": "orange", "value": 10}, {"color": "green", "value": 25}]))
+    p.append(stat(55, "Paper jams (printer + ADF)", [q(f'sum(brother_paper_jams_total{{{H},location=~"total|adf_simplex|adf_duplex"}})')], 12, y, 3, 4, decimals=0))
+    p.append(stat(56, "Toner / drum replaced", [q(f'brother_replacements_total{{{H}}}', "{{part}}")], 15, y, 3, 4, decimals=0))
+    p.append(stat(57, "Avg coverage", [q(f'brother_average_coverage_percent{{{H}}}')], 18, y, 3, 4, unit="percent", decimals=2))
+    p.append(stat(58, "Maintenance page", [q(f'brother_ews_up{{{H}}}')], 21, y, 3, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
+    y += 4
+    p.append(ts(59, "Pages printed per day (printer counter)", [q(f'increase(brother_pages_printed_total{{{H}}}[1d])', "printed"), q(f'increase(brother_pages_printed_duplex_total{{{H},function="total"}}[1d])', "2-sided", ref="B")], 0, y, 8, 7, min_=0))
+    p.append(ts(60, "Pages scanned per day", [q(f'sum by (source) (increase(brother_pages_scanned_detail_total{{{H}}}[1d]))', "{{source}}")], 8, y, 8, 7, min_=0, stack=True))
+    p.append(table(61, "Error history (page counter when it happened)", [q(f'brother_error_history{{{H}}}', instant=True)], 16, y, 8, 7))
+    y += 7
+    p.append(table(62, "Pages printed by function", [q(f'brother_pages_printed_detail_total{{{H},breakdown="function"}}', instant=True), q(f'brother_pages_printed_duplex_total{{{H}}}', ref="B", instant=True)], 0, y, 8, 6))
+    p.append(table(63, "Pages printed by paper size", [q(f'brother_pages_printed_detail_total{{{H},breakdown="size"}}', instant=True)], 8, y, 8, 6))
+    p.append(table(64, "Pages printed by paper type", [q(f'brother_pages_printed_detail_total{{{H},breakdown="type"}}', instant=True)], 16, y, 8, 6))
+    y += 6
     p.append(row(30, "Pages (CUPS page_log via Loki)", y)); y += 1
     p.append(ts(31, "Pages printed per day", [q('sum(count_over_time({job="cups-page-log"} [1d]))', "pages", ds=LOKI)], 0, y, 12, 7, min_=0, ds=LOKI))
     p.append(ts(32, "Pages per user (per day)", [q('sum by (user) (count_over_time({job="cups-page-log"} | pattern "<printer> <user> <job> <_>" [1d]))', "{{user}}", ds=LOKI)], 12, y, 12, 7, min_=0, stack=True, ds=LOKI))
