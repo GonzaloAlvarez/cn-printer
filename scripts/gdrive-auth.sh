@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --remote-path) REMOTE_PATH="$2"; shift ;;
     --kauket) DO_KAUKET=1 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     -*) die "unknown flag $1" ;;
     *) if [ -z "$CID" ]; then CID="$1"; elif [ -z "$CSEC" ]; then CSEC="$1"; else die "unexpected argument $1"; fi ;;
   esac
