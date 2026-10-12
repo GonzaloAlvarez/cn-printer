@@ -40,8 +40,10 @@ services:
     restart: unless-stopped
 
   # cupsd — own trixie image, driverless IPP over ipp-usb, raster-only PPD.
-  # DNS-SD (AirPrint) is published through the HOST avahi over its D-Bus
-  # socket; the record points at this host's :631 == the sidecar's port.
+  # The AirPrint record is a static service file written into the HOST avahi's
+  # services dir (CUPS 2.4's own DNS-SD hard-codes the _cups subtype, which
+  # makes macOS fall back to Generic PostScript); it points at this host's :631
+  # == the sidecar's published port.
   cups:
     build: ./cups
     image: cn-printer-cups:local
@@ -56,12 +58,15 @@ services:
       - CUPS_ADMIN_USER=${CUPS_ADMIN_USER}
       - CUPS_ADMIN_PASSWORD=${CUPS_ADMIN_PASSWORD}
       - CUPS_ALLOW=${CUPS_ALLOW}
-      - CUPS_BROWSING=On
+      - CUPS_BROWSING=Off
+      - PRINTER_ADVERTISE=yes
+      - PRINTER_ADVERTISE_NAME=${PRINTER_ADVERTISE_NAME}
+      - PRINTER_ADVERTISE_HOST=${PRINTER_ADVERTISE_HOST}
       - TZ=${TIMEZONE}
     volumes:
       - cups_etc:/etc/cups
       - ${CUPS_LOG_DIR}:/var/log/cups
-      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+      - /etc/avahi/services:/etc/avahi/services
     labels:
       com.centurylinklabs.watchtower.enable: "false"   # local build
     restart: unless-stopped

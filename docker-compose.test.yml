@@ -41,11 +41,13 @@ services:
   cups:
     depends_on: [ts-printer, ippeve]
     environment:
-      - CUPS_BROWSING=Off          # no host avahi/D-Bus in test
+      - CUPS_BROWSING=Off
       - PRINTER_WAIT_SECONDS=90
+      - PRINTER_ADVERTISE_HOST=localhost
     volumes: !override
       - cups_etc:/etc/cups
       - ${CUPS_LOG_DIR}:/var/log/cups
+      - avahi_services:/etc/avahi/services   # stand-in for the host dir; the record is still written
 
   scanservjs:
     volumes: !override
@@ -85,3 +87,4 @@ services:
 
 volumes:
   ippeve_spool:
+  avahi_services:
