@@ -4,6 +4,10 @@
 #   print: lp → CUPS raster-only queue → ippeveprinter spool holds PWG/URF raster, never PDF
 #   scan : scanservjs REST on the SANE `test` device → downloadable PNG and PDF
 #   swis : UI up, upload + print → a second raster job
+#   edge : traefik-lan routes Host: scan.print.lan to scanservjs
+#   drive: PDF is the default pipeline; OCR PDF works; "→ Google Drive" pipeline
+#          and the Files-tab action land the file on the rclone remote (a local
+#          stand-in in test)
 #   cups-exporter: cups_up 1, printer state idle
 #   ./test [--in-vm] [--keep]      --keep leaves the stack up for inspection
 set -euo pipefail
@@ -21,7 +25,7 @@ done
 
 P=cn-printer-test
 DC=(docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test -p "$P")
-CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; SWIS=http://127.0.0.1:15520; EXP=http://127.0.0.1:19329
+CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; SWIS=http://127.0.0.1:15520; EXP=http://127.0.0.1:19329; EDGE=http://127.0.0.1:18081
 Q=Brother_MFC-L2750DW
 PASS=0; FAIL=0; WARN=0; SKIP=0
 LINUX=0; [ "$(uname -s)" = Linux ] && LINUX=1   # bind-mount ownership is only meaningful on Linux (Docker Desktop virtualizes it)
@@ -44,9 +48,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cn-printer test =="
-mkdir -p .test/scans/swis .test/cups-log
-chmod 0777 .test/scans .test/scans/swis .test/cups-log            # containers write as uid 1000 / root
+mkdir -p .test/scans/swis .test/cups-log .test/rclone .test/drive-out
+chmod 0777 .test/scans .test/scans/swis .test/cups-log .test/rclone .test/drive-out   # containers write/rename as uid 1000 / root
 printf '[options]\ndiscovery = disable\n' > .test/airscan.conf    # no real scanner in test
+printf '[gdrive]\ntype = local\n' > .test/rclone/rclone.conf       # Google Drive stand-in: rclone local remote
+rm -f .test/drive-out/* 2>/dev/null || true
 
 check "compose config renders" "${DC[@]}" config --quiet
 echo "[test] building images and starting the stack"
@@ -121,6 +127,7 @@ scan_one() { # pipeline expected-magic-regex label
   resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan" 2>/dev/null)" \
     || { note "scan ($1): request failed once, retrying"; sleep 5; resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan")" || { note "scan ($1): request failed"; return 1; }; }
   name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["file"]["name"])' "$resp" 2>/dev/null)" || { note "scan ($1): $resp"; return 1; }
+  LAST_SCAN_NAME="$name"
   out=".test/out/$name"
   local enc; enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$name")"
   curl -fsS -o "$out" "$SCAN/api/v1/files/$enc" || return 1
@@ -130,9 +137,41 @@ scan_one() { # pipeline expected-magic-regex label
     [ "$(cx scanservjs stat -c %u "/var/lib/scanservjs/output/$name" 2>/dev/null | tr -d '\r')" = "1000" ] || { note "scan ($1): file not owned by uid 1000"; return 1; }
   fi
 }
+LAST_SCAN_NAME=""
 check "scan to PNG via REST, downloadable" scan_one "PNG" '^.PNG'
+png_name="$LAST_SCAN_NAME"
 check "scan to PDF via REST, downloadable" scan_one "PDF (JPG | @:pipeline.high-quality)" '^%PDF'
 check "scan files listed by the API" bash -c "curl -fsS '$SCAN/api/v1/files' | python3 -c 'import json,sys; sys.exit(0 if len(json.load(sys.stdin))>=2 else 1)'"
+check "default pipeline is PDF" bash -c "curl -fsS '$SCAN/api/v1/context' | python3 -c 'import json,sys; d=json.load(sys.stdin); dflt=d[\"devices\"][0][\"settings\"][\"pipeline\"][\"default\"]; print(dflt); sys.exit(0 if dflt.startswith(\"PDF\") else 1)'"
+check "scan to searchable PDF (tesseract OCR)" scan_one "@:pipeline.ocr | PDF (JPG | @:pipeline.high-quality)" '^%PDF'
+
+# ── Google Drive (rclone → a local stand-in remote mounted at .test/drive-out) ─
+echo; echo "Google Drive:"
+drive_wait() { local i; for ((i = 0; i < 40; i += 2)); do [ -s ".test/drive-out/$1" ] && return 0; sleep 2; done; ls -la .test/drive-out | sed 's/^/      | /'; return 1; }
+check "scan with the 'PDF → Google Drive' pipeline" scan_one "PDF → Google Drive" '^%PDF'
+if [ -n "$LAST_SCAN_NAME" ]; then
+  check "afterAction uploaded it to the remote" drive_wait "$LAST_SCAN_NAME"
+  check "no .gdrive-FAILED marker was written" bash -c "! ls .test/scans/ | grep -q 'gdrive-FAILED'"
+  [ -s ".test/drive-out/$LAST_SCAN_NAME" ] && evidence "drive (pipeline) → .test/drive-out/$LAST_SCAN_NAME: $(describe ".test/drive-out/$LAST_SCAN_NAME")"
+fi
+if [ -n "$png_name" ]; then
+  enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$png_name")"
+  check "Files-tab action 'Upload to Google Drive' on an existing scan" curl -fsS -X POST "$SCAN/api/v1/files/$enc/actions/Upload%20to%20Google%20Drive"
+  check "action uploaded it to the remote" drive_wait "$png_name"
+fi
+# a missing rclone.conf must surface as an error in the UI, not crash the server
+if [ -n "$png_name" ]; then
+  cx scanservjs sh -c 'mv /etc/rclone/rclone.conf /etc/rclone/rclone.conf.off' >/dev/null 2>&1 || true
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$SCAN/api/v1/files/$enc/actions/Upload%20to%20Google%20Drive")"
+  cx scanservjs sh -c 'mv /etc/rclone/rclone.conf.off /etc/rclone/rclone.conf' >/dev/null 2>&1 || true
+  check "action without rclone.conf fails cleanly (HTTP 500, server alive)" bash -c "[ '$code' = 500 ] && curl -fs -o /dev/null '$SCAN/api/v1/system'"
+fi
+
+# ── LAN edge (traefik-lan → scanservjs by Host header) ───────────────────────
+echo; echo "Edge:"
+check "traefik-lan routes Host: scan.print.lan to scanservjs" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Host: scan.print.lan' '$EDGE/api/v1/system')\" = 200 ]"
+check "traefik-lan serves the scan UI root"                   bash -c "curl -fsS -m 10 -H 'Host: scan.print.lan' '$EDGE/' | grep -qi '<html'"
+check "traefik-lan answers 404 for an unknown host"           bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Host: nothing.example' '$EDGE/')\" = 404 ]"
 
 # ── swis ─────────────────────────────────────────────────────────────────────
 echo; echo "swis:"

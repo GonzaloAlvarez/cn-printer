@@ -1,0 +1,36 @@
+# cn-printer traefik-lan dynamic config — rendered by setup.sh (sed on
+# @SCAN_LAN_HOST@) into traefik-lan/dynamic.yml (gitignored). Single-file
+# bind mount: after a git pull that changes this file run
+#   docker compose up -d --force-recreate --no-deps traefik-lan
+# Backends are the ports ts-printer publishes on the host (traefik-lan runs
+# with network_mode: host, so 127.0.0.1 here is the Pi).
+http:
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  routers:
+    # Any plain-HTTP request is bumped to HTTPS. ACME HTTP-01 is answered by
+    # Traefik before routers run, so step-ca validation still works on :80.
+    http-catchall:
+      rule: "HostRegexp(`.+`)"
+      entryPoints: [web]
+      middlewares: [https-redirect]
+      service: noop@internal
+      priority: 1
+
+    # https://scan.print.lan → scanservjs (step-ca leaf via the stepca resolver)
+    scan-lan:
+      rule: "Host(`@SCAN_LAN_HOST@`)"
+      entryPoints: [websecure]
+      service: scanservjs
+      tls:
+        certResolver: stepca
+
+  services:
+    scanservjs:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"

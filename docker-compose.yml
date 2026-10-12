@@ -71,10 +71,14 @@ services:
       com.centurylinklabs.watchtower.enable: "false"   # local build
     restart: unless-stopped
 
-  # scanservjs — scan UI (:8080). Static airscan.conf (rendered by setup.sh)
-  # instead of the image's AIRSCAN_DEVICES env, whose entrypoint appends a
-  # duplicate [devices] line on every restart. Output lands in the shared
-  # /srv/scans tree as uid 1000 so Samba/Stirling see gonzalo-owned files.
+  # scanservjs — scan UI (:8080, and https://scan.print.lan through traefik-lan).
+  # Own image = upstream v3.3.0 + pinned rclone (scanservjs/Dockerfile) for the
+  # Google Drive uploads wired in scanservjs/config.local.js (PDF-first
+  # pipelines, OCR via the image's tesseract, "→ Google Drive" pipelines and a
+  # Files-tab action). Static airscan.conf (rendered by setup.sh) instead of
+  # the image's AIRSCAN_DEVICES env, whose entrypoint appends a duplicate
+  # [devices] line on every restart. Output lands in the shared /srv/scans
+  # tree as uid 1000 so Samba/Stirling see gonzalo-owned files.
   # One-shot: the named data volume inherits root ownership from the image;
   # hand it to uid 1000 so scanservjs can run unprivileged. The name matches
   # amun-docker reconcile's SKIP_RE (…-init) so it is never restart-looped.
@@ -87,7 +91,8 @@ services:
     restart: "no"
 
   scanservjs:
-    image: sbs20/scanservjs:v3.3.0
+    build: ./scanservjs
+    image: cn-printer-scanservjs:local
     network_mode: "service:ts-printer"
     depends_on:
       ts-printer:
@@ -97,11 +102,18 @@ services:
     user: "${SCANS_UID}:${SCANS_GID}"
     environment:
       - TZ=${TIMEZONE}
+      - OCR_LANG=${SCAN_OCR_LANG}
+      # Google Drive (config.local.js): rclone remote:path, and the Kauket-managed
+      # rclone.conf in ./rclone — mounted read-write so rclone can persist the
+      # OAuth tokens it refreshes (the container runs as SCANS_UID, the file's owner).
+      - GDRIVE_REMOTE_PATH=${GDRIVE_REMOTE_PATH}
+      - RCLONE_CONFIG=/etc/rclone/rclone.conf
       # NOTE: do not set SCANIMAGE_LIST_IGNORE (even empty) — its mere presence
       # disables `scanimage -L` discovery and the device list stays empty.
     volumes:
       - ./sane/airscan.conf:/etc/sane.d/airscan.conf:ro
       - ./scanservjs/config.local.js:/etc/scanservjs/config.local.js:ro
+      - ./rclone:/etc/rclone
       - scanservjs_data:/var/lib/scanservjs
       - ${SCANS_DIR}:/var/lib/scanservjs/output
     healthcheck:
@@ -110,6 +122,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 40s
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # local build (pinned upstream tag inside)
     restart: unless-stopped
 
   # swis — second UI (:5520): scan + upload-to-print (lp to the CUPS default
@@ -132,6 +146,37 @@ services:
       - ${SCANS_DIR}:/srv/scans
     labels:
       com.centurylinklabs.watchtower.enable: "false"   # local build
+    restart: unless-stopped
+
+  # ── LAN edge: https://scan.print.lan → scanservjs ─────────────────────────
+  # Host network like cn-nvr's traefik-lan: it owns the Pi's 80/443 (ufw holes
+  # from amun printer — host-network listeners do not bypass ufw) and reaches
+  # the UI on the port ts-printer publishes. step-ca ACME HTTP-01: pki resolves
+  # the name through pfSense (cn-home LAN_HOSTS) and clients through Technitium
+  # (cn-dnsdhcpd records.tsv). Pinned tag (bump by hand, like cn-nvr).
+  traefik-lan:
+    image: traefik:v3.6.9
+    network_mode: host
+    command:
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--certificatesresolvers.stepca.acme.caserver=https://${PKI_HOST}:9000/acme/acme/directory"
+      - "--certificatesresolvers.stepca.acme.email=${ADMIN_EMAIL}"
+      - "--certificatesresolvers.stepca.acme.storage=/acme/acme.json"
+      - "--certificatesresolvers.stepca.acme.httpchallenge.entrypoint=web"
+      - "--log.level=INFO"
+    environment:
+      - LEGO_CA_CERTIFICATES=/certs/root_ca.crt
+    volumes:
+      - ./traefik-lan/dynamic.yml:/etc/traefik/dynamic.yml:ro   # rendered by setup.sh
+      - ./certs/root_ca.crt:/certs/root_ca.crt:ro               # fetched by setup.sh
+      - traefik_lan_acme:/acme
+    # Host-network Traefik ships an empty resolv.conf on this Docker version
+    # (cn-vaultwarden, 2026-06-23): pin the only name it must dial.
+    extra_hosts:
+      - "${PKI_HOST}:${PKI_IP}"
     restart: unless-stopped
 
   # ── LAN-side observability for kaiser (cn-observability) ─────────────────
@@ -183,9 +228,10 @@ services:
       - promtail_positions:/tmp
     restart: unless-stopped
 
-  # Host-wide auto-update (one Watchtower per host). Local builds opt out via
-  # the label above; sbs20/scanservjs is pinned to a tag on purpose — bump it
-  # by hand after reading its release notes (pipeline/config.local.js API).
+  # Host-wide auto-update (one Watchtower per host). Local builds (cups, swis,
+  # scanservjs, cups-exporter) opt out via their labels; scanservjs's upstream
+  # tag and rclone are pinned in scanservjs/Dockerfile on purpose — bump them
+  # by hand after reading the release notes (pipeline/config.local.js API).
   watchtower:
     image: containrrr/watchtower:latest
     command:
@@ -234,3 +280,4 @@ volumes:
   cups_etc:
   scanservjs_data:
   promtail_positions:
+  traefik_lan_acme:

@@ -9,7 +9,7 @@ Outputs (committed into cn-observability's provisioning dir):
 
 Re-run after editing; keep uids stable (printer-overview, cups). Metric sources:
 node-exporter-lan (host=printer), amun-printer's rpi.prom textfile, cn-printer's
-cups-exporter (job=printer-cups), blackbox-http probes, promtail-lan (Loki).
+cups-exporter (job=printer-cups), blackbox-http/https probes, promtail-lan (Loki).
 
     ./build-dashboards.py [path/to/cn-observability]   (default ../../cn-observability)
 """
@@ -178,7 +178,7 @@ def cups_dashboard():
                   thresholds=[{"color": "red", "value": None}, {"color": "orange", "value": 10}, {"color": "green", "value": 25}], color_mode="value"))
     y += 4
     p.append(stat(9, "CUPS web/IPP :631", [q('probe_success{instance="http://printer.lan:631/"}')], 0, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
-    p.append(stat(10, "scanservjs :8080", [q('probe_success{instance="http://printer.lan:8080/api/v1/system"}')], 4, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
+    p.append(stat(10, "Scan UI scan.print.lan", [q('probe_success{instance="https://scan.print.lan/api/v1/system"}')], 4, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(11, "swis :5520", [q('probe_success{instance="http://printer.lan:5520/app/"}')], 8, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(12, "cups-exporter scrape", [q('up{job="printer-cups"}')], 12, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(13, "Device state (ipp-usb)", [q(f'printer_device_state{{{H},printer="device"}}')], 16, y, 4, 4, color_mode="background",

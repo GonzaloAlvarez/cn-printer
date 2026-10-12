@@ -1,0 +1,14 @@
+# ./test stand-in for traefik-lan/dynamic.yml: same router, plain HTTP on the
+# test entrypoint (no step-ca in the test stack). traefik-lan joins the
+# ts-printer netns in test, so 127.0.0.1:8080 is scanservjs.
+http:
+  routers:
+    scan-lan:
+      rule: "Host(`scan.print.lan`)"
+      entryPoints: [web]
+      service: scanservjs
+  services:
+    scanservjs:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"

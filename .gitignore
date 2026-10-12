@@ -2,5 +2,8 @@
 .env.test.local
 .test/
 cups/log/
+certs/
+traefik-lan/dynamic.yml
+rclone/*.conf
 *.bak
 .DS_Store

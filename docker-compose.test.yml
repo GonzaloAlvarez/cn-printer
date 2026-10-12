@@ -4,6 +4,8 @@
 #     127.0.0.1:1xxxx so a Mac's own cupsd on :631 never collides
 #   * ippeve: ippeveprinter stands in for the Brother at ipp://localhost:8631
 #   * the SANE `test` backend stands in for the scanner (test:0)
+#   * traefik-lan joins the netns, plain HTTP on :18081, no step-ca
+#   * the Google Drive remote is an rclone `local` remote → ./.test/drive-out
 #   * production-only services move behind the `prod` profile
 # Used by ./test: docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test
 services:
@@ -19,6 +21,7 @@ services:
       - "127.0.0.1:18080:8080"   # scanservjs
       - "127.0.0.1:15520:5520"   # swis
       - "127.0.0.1:19329:9329"   # cups-exporter (joins the netns in test)
+      - "127.0.0.1:18081:18081"  # traefik-lan (joins the netns in test; plain HTTP)
 
   ippeve:
     image: cn-printer-ippeve:test
@@ -55,8 +58,22 @@ services:
       - ./sane/dll.conf:/etc/sane.d/dll.conf:ro
       - ./sane/test.conf:/etc/sane.d/test.conf:ro
       - ./scanservjs/config.local.js:/etc/scanservjs/config.local.js:ro
+      - ./.test/rclone:/etc/rclone                 # [gdrive] type = local (written by ./test)
+      - ./.test/drive-out:/drive-out               # where the stand-in "Drive" lands
       - scanservjs_data:/var/lib/scanservjs
       - ${SCANS_DIR}:/var/lib/scanservjs/output
+
+  traefik-lan:
+    network_mode: "service:ts-printer"
+    depends_on: [ts-printer]
+    command: !override
+      - "--entrypoints.web.address=:18081"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--log.level=INFO"
+    environment: !reset []
+    extra_hosts: !reset []
+    volumes: !override
+      - ./traefik-lan/dynamic.test.yml:/etc/traefik/dynamic.yml:ro
 
   swis:
     environment:
