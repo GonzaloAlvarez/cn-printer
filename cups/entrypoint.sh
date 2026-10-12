@@ -48,6 +48,10 @@ ServerAlias *
 # so phones/laptops see an AirPrint/IPP Everywhere printer.
 Browsing ${CUPS_BROWSING}
 BrowseLocalProtocols dnssd
+# No _cups subtype: with it macOS enumerates the queue as dnssd://…/cups and
+# treats it as a remote CUPS queue (Use: Generic PostScript, no AirPrint
+# offered). _print + _universal make it an AirPrint / IPP Everywhere printer.
+DNSSDSubTypes _print,_universal
 DefaultAuthType Basic
 WebInterface Yes
 IdleExitTimeout 60
