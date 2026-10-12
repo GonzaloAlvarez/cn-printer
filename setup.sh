@@ -29,9 +29,13 @@ DEVICE_URI="$(env_get PRINTER_DEVICE_URI)"; [[ -n "$DEVICE_URI" ]] || die "PRINT
 SCANS_DIR="$(env_get SCANS_DIR)";         SCANS_DIR="${SCANS_DIR:-/srv/scans}"
 SCANS_UID="$(env_get SCANS_UID)";         SCANS_UID="${SCANS_UID:-1000}"
 CUPS_LOG_DIR="$(env_get CUPS_LOG_DIR)";   CUPS_LOG_DIR="${CUPS_LOG_DIR:-./cups/log}"
+# The LAN-edge keys have the same defaults in docker-compose.yml, so an older
+# Kauket .env still works; refresh it (kauket get) to make them explicit.
 SCAN_LAN_HOST="$(env_get SCAN_LAN_HOST)"; SCAN_LAN_HOST="${SCAN_LAN_HOST:-scan.print.lan}"
 PKI_HOST="$(env_get PKI_HOST)";           PKI_HOST="${PKI_HOST:-pki.lan}"
-[[ -n "$(env_get PKI_IP)" ]]              || die "PKI_IP empty in .env (traefik-lan pins ${PKI_HOST} to it)"
+for k in SCAN_LAN_HOST PKI_HOST PKI_IP SCAN_OCR_LANG GDRIVE_REMOTE_PATH; do
+  [[ -n "$(env_get "$k")" ]] || warn "$k missing in .env — using the compose default (refresh: kauket get printer.cn_printer_env)"
+done
 [[ -n "$(env_get ADMIN_EMAIL)" ]]         || warn "ADMIN_EMAIL is empty — step-ca ACME registration will carry no contact"
 [[ -n "$(env_get PRINTER_AUTHKEY)" ]]     || warn "PRINTER_AUTHKEY is empty — ts-printer will not join the tailnet"
 [[ -n "$(env_get CUPS_ADMIN_PASSWORD)" ]] || warn "CUPS_ADMIN_PASSWORD is empty — the :631 admin pages will have no login"

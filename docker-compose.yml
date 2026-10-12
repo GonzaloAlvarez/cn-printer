@@ -102,11 +102,11 @@ services:
     user: "${SCANS_UID}:${SCANS_GID}"
     environment:
       - TZ=${TIMEZONE}
-      - OCR_LANG=${SCAN_OCR_LANG}
+      - OCR_LANG=${SCAN_OCR_LANG:-eng+spa}
       # Google Drive (config.local.js): rclone remote:path, and the Kauket-managed
       # rclone.conf in ./rclone — mounted read-write so rclone can persist the
       # OAuth tokens it refreshes (the container runs as SCANS_UID, the file's owner).
-      - GDRIVE_REMOTE_PATH=${GDRIVE_REMOTE_PATH}
+      - GDRIVE_REMOTE_PATH=${GDRIVE_REMOTE_PATH:-gdrive:Scans}
       - RCLONE_CONFIG=/etc/rclone/rclone.conf
       # NOTE: do not set SCANIMAGE_LIST_IGNORE (even empty) — its mere presence
       # disables `scanimage -L` discovery and the device list stays empty.
@@ -154,6 +154,9 @@ services:
   # the UI on the port ts-printer publishes. step-ca ACME HTTP-01: pki resolves
   # the name through pfSense (cn-home LAN_HOSTS) and clients through Technitium
   # (cn-dnsdhcpd records.tsv). Pinned tag (bump by hand, like cn-nvr).
+  # The new .env keys carry compose-level defaults so an older Kauket .env
+  # still renders (the reconcile cron and the boot unit run `docker compose`
+  # unattended); setup.sh is what actually brings this service to life.
   traefik-lan:
     image: traefik:v3.6.9
     network_mode: host
@@ -162,8 +165,8 @@ services:
       - "--entrypoints.websecure.address=:443"
       - "--providers.file.filename=/etc/traefik/dynamic.yml"
       - "--providers.file.watch=true"
-      - "--certificatesresolvers.stepca.acme.caserver=https://${PKI_HOST}:9000/acme/acme/directory"
-      - "--certificatesresolvers.stepca.acme.email=${ADMIN_EMAIL}"
+      - "--certificatesresolvers.stepca.acme.caserver=https://${PKI_HOST:-pki.lan}:9000/acme/acme/directory"
+      - "--certificatesresolvers.stepca.acme.email=${ADMIN_EMAIL:-}"
       - "--certificatesresolvers.stepca.acme.storage=/acme/acme.json"
       - "--certificatesresolvers.stepca.acme.httpchallenge.entrypoint=web"
       - "--log.level=INFO"
@@ -176,7 +179,7 @@ services:
     # Host-network Traefik ships an empty resolv.conf on this Docker version
     # (cn-vaultwarden, 2026-06-23): pin the only name it must dial.
     extra_hosts:
-      - "${PKI_HOST}:${PKI_IP}"
+      - "${PKI_HOST:-pki.lan}:${PKI_IP:-10.0.0.250}"
     restart: unless-stopped
 
   # ── LAN-side observability for kaiser (cn-observability) ─────────────────
