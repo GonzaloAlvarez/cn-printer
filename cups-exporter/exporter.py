@@ -50,6 +50,15 @@ def _as_list(v):
     return v if isinstance(v, list) else [v]
 
 
+def _lbl(seq, i, fallback):
+    """pycups renders some device-side attribute tags as "(unknown IPP value tag …)";
+    keep only clean strings as label values."""
+    v = seq[i] if i < len(seq) else None
+    if isinstance(v, str) and v and not v.startswith("("):
+        return v
+    return fallback
+
+
 def _markers(metric, label, attrs):
     levels = _as_list(attrs.get("marker-levels"))
     names = _as_list(attrs.get("marker-names"))
@@ -57,10 +66,7 @@ def _markers(metric, label, attrs):
     colors = _as_list(attrs.get("marker-colors"))
     for i, lvl in enumerate(levels):
         if isinstance(lvl, int) and lvl >= 0:
-            metric.add_metric(
-                [label, str(names[i] if i < len(names) else i), str(types[i] if i < len(types) else ""), str(colors[i] if i < len(colors) else "")],
-                lvl,
-            )
+            metric.add_metric([label, _lbl(names, i, f"marker{i}"), _lbl(types, i, ""), _lbl(colors, i, "")], lvl)
 
 
 class CupsCollector:
