@@ -89,6 +89,8 @@ Deliberate omissions: no Consul/traefik-lab route (plain HTTP on the tailnet by 
 ./test --keep     # leave the stack up: http://127.0.0.1:18080 (scan UI), :16310 (CUPS), :15520 (swis)
 ```
 
+On macOS Docker Desktop a long scan request is occasionally dropped by the port forwarder; the scan step retries once (a real failure still fails both attempts). Linux runs (kora VM, rpid11, the Pi) have never shown it.
+
 Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --post tests/vm-e2e.sh`), after `amun`, `amun docker` and `amun printer` have converged. Static checks: `docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test config --quiet`, `shellcheck cups/* swis/entrypoint.sh setup.sh test scripts/*.sh`, `python3 -m py_compile cups-exporter/exporter.py`.
 
 ## Gotchas

@@ -116,7 +116,10 @@ check "scanservjs lists the sane-test device" test -n "$dev"
 scan_one() { # pipeline expected-magic-regex label
   local body resp name out
   body="$(python3 -c 'import json,sys; print(json.dumps({"params":{"deviceId":sys.argv[1],"resolution":300,"mode":"Color","source":"Flatbed","top":0,"left":0,"width":210,"height":297},"filters":[],"pipeline":sys.argv[2],"batch":"none","index":1}))' "$dev" "$1")"
-  resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan")" || { note "scan ($1): request failed"; return 1; }
+  # one retry: Docker Desktop's port forwarding occasionally drops a long scan request on macOS
+  # (never seen on Linux hosts); a real failure still fails both attempts
+  resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan" 2>/dev/null)" \
+    || { note "scan ($1): request failed once, retrying"; sleep 5; resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan")" || { note "scan ($1): request failed"; return 1; }; }
   name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["file"]["name"])' "$resp" 2>/dev/null)" || { note "scan ($1): $resp"; return 1; }
   out=".test/out/$name"
   local enc; enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$name")"
