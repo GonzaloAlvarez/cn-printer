@@ -107,9 +107,14 @@ class CupsCollector:
                     age = now - j.get("time-at-creation", now)
                     pending_oldest[pname] = max(pending_oldest.get(pname, 0), age)
             for name, p in printers.items():
+                # getPrinters() omits printer-is-accepting-jobs; ask for it explicitly
+                try:
+                    extra = conn.getPrinterAttributes(name, requested_attributes=["printer-is-accepting-jobs", "printer-is-shared"])
+                except Exception:
+                    extra = {}
                 state.add_metric([name], p.get("printer-state", 0))
-                accepting.add_metric([name], 1 if p.get("printer-is-accepting-jobs") else 0)
-                shared.add_metric([name], 1 if p.get("printer-is-shared") else 0)
+                accepting.add_metric([name], 1 if extra.get("printer-is-accepting-jobs", p.get("printer-is-accepting-jobs")) else 0)
+                shared.add_metric([name], 1 if extra.get("printer-is-shared", p.get("printer-is-shared")) else 0)
                 for r in _as_list(p.get("printer-state-reasons")):
                     if r and r != "none":
                         reason.add_metric([name, r], 1)
