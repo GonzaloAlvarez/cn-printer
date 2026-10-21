@@ -3,7 +3,7 @@
 
 Outputs (committed into cn-observability's provisioning dir):
   <cn-observability>/config/grafana/provisioning/dashboards/printer-overview.json
-      host overview (same panel set as kaiser/neptune/cerberus) + Pi power/thermal
+      host overview (same panel set as kaiser/neptune/cerberus) + thermal; Pi power flags when the host is a Pi
   <cn-observability>/config/grafana/provisioning/dashboards/cups.json
       CUPS print server: queue, jobs, printer state reasons, toner, pages (Loki)
 
@@ -103,7 +103,8 @@ RED = [{"color": "green", "value": None}, {"color": "orange", "value": 75}, {"co
 GREEN_ON_1 = [{"color": "red", "value": None}, {"color": "green", "value": 1}]
 
 
-# ── Printer host overview (kaiser/neptune/cerberus panel set + Pi power/thermal) ──
+# ── Printer host overview (kaiser/neptune/cerberus panel set + thermal; the Pi power
+#    flags stay as a row that is simply empty on a non-Pi host such as the NUC) ──
 def printer_overview():
     p = []
     y = 0
@@ -111,25 +112,26 @@ def printer_overview():
     p.append(stat(2, "CPU usage", [q(f'(1 - avg(rate(node_cpu_seconds_total{{{H},mode="idle"}}[5m]))) * 100', "cpu %")], 0, y, 4, 5, unit="percent", decimals=0, thresholds=RED, color_mode="background", graph="area"))
     p.append(stat(3, "Memory used", [q(f'(1 - node_memory_MemAvailable_bytes{{{H}}} / node_memory_MemTotal_bytes{{{H}}}) * 100', "mem %")], 4, y, 4, 5, unit="percent", decimals=0, thresholds=RED, color_mode="background", graph="area"))
     p.append(stat(4, "Disk used (/ on the SSD)", [q(f'(1 - node_filesystem_avail_bytes{{{H},mountpoint="/"}} / node_filesystem_size_bytes{{{H},mountpoint="/"}}) * 100', "disk %")], 8, y, 4, 5, unit="percent", decimals=0, thresholds=RED, color_mode="background", graph="area"))
-    p.append(stat(5, "SoC temperature", [q(f'rpi_soc_temp_celsius{{{H}}} or node_hwmon_temp_celsius{{{H}}}', "°C")], 12, y, 4, 5, unit="celsius", decimals=0,
+    p.append(stat(5, "CPU temperature", [q(f'max(rpi_soc_temp_celsius{{{H}}} or node_hwmon_temp_celsius{{{H},chip=~"platform_coretemp.*|.*cpu_thermal.*"}})', "°C")], 12, y, 4, 5, unit="celsius", decimals=0,
                   thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 70}, {"color": "red", "value": 80}], color_mode="background", graph="area"))
-    p.append(stat(6, "Under-voltage NOW", [q(f'rpi_undervoltage_now{{{H}}}')], 16, y, 4, 5, mappings=YESNO, color_mode="background",
+    # The 2026-10-19 outage signature: ext4 remounted read-only under the running stack.
+    p.append(stat(6, "Root filesystem read-only", [q(f'max(node_filesystem_readonly{{{H},mountpoint="/"}})')], 16, y, 4, 5, mappings=YESNO, color_mode="background",
                   thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}]))
-    p.append(stat(7, "Under-voltage since boot", [q(f'rpi_undervoltage_occurred{{{H}}}')], 20, y, 4, 5, mappings=YESNO, color_mode="background",
-                  thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}]))
+    p.append(stat(7, "Uptime", [q(f'time() - node_boot_time_seconds{{{H}}}')], 20, y, 4, 5, unit="s", decimals=0))
     y += 5
-    p.append(stat(8, "Uptime", [q(f'time() - node_boot_time_seconds{{{H}}}')], 0, y, 4, 4, unit="s", decimals=0))
-    p.append(stat(9, "Throttled now", [q(f'rpi_throttled_now{{{H}}}')], 4, y, 4, 4, mappings=YESNO, color_mode="background", thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}]))
-    p.append(stat(10, "Core voltage", [q(f'rpi_core_volts{{{H}}}')], 8, y, 4, 4, unit="volt", decimals=3))
+    p.append(stat(8, "Node exporter scrape", [q('up{job="printer-node"}')], 0, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
+    p.append(stat(9, "Swap used", [q(f'(1 - node_memory_SwapFree_bytes{{{H}}} / node_memory_SwapTotal_bytes{{{H}}}) * 100', "swap %")], 4, y, 4, 4, unit="percent", decimals=0, thresholds=RED, color_mode="background"))
+    p.append(stat(10, "Network errors (5m, physical ifaces)", [q(f'sum(rate(node_network_receive_errs_total{{{H},device!~"lo|docker.*|br-.*|veth.*|tailscale.*"}}[5m]) + rate(node_network_transmit_errs_total{{{H},device!~"lo|docker.*|br-.*|veth.*|tailscale.*"}}[5m]))')], 8, y, 4, 4, decimals=0,
+                  thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}]))
     p.append(stat(11, "Resilience boot unit (cn-printer)", [q('resilience_boot_unit_active{stack="cn-printer"}')], 12, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
     p.append(stat(12, "Reconcile repairs (24h)", [q('sum(increase(resilience_reconcile_repairs_total{stack="cn-printer"}[24h]))')], 16, y, 4, 4, decimals=0,
                   thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]))
     p.append(stat(13, "Load (1m)", [q(f'node_load1{{{H}}}')], 20, y, 4, 4, decimals=2))
     y += 4
-    p.append(row(20, "Power and thermal (the reboot investigation)", y)); y += 1
-    p.append(ts(21, "SoC temperature", [q(f'rpi_soc_temp_celsius{{{H}}}', "SoC °C")], 0, y, 12, 7, unit="celsius", min_=20,
+    p.append(row(20, "Thermal, and the Raspberry Pi power flags (empty on a non-Pi host such as the NUC)", y)); y += 1
+    p.append(ts(21, "CPU temperature", [q(f'rpi_soc_temp_celsius{{{H}}} or node_hwmon_temp_celsius{{{H},chip=~"platform_coretemp.*|.*cpu_thermal.*"}}', "{{chip}} {{sensor}}")], 0, y, 12, 7, unit="celsius", min_=20,
                 thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 80}]))
-    p.append(ts(22, "Under-voltage / throttling flags (1 = active)", [
+    p.append(ts(22, "Under-voltage / throttling flags (Raspberry Pi only; 1 = active)", [
         q(f'rpi_undervoltage_now{{{H}}}', "under-voltage now"),
         q(f'rpi_throttled_now{{{H}}}', "throttled now", ref="B"),
         q(f'rpi_frequency_capped_now{{{H}}}', "freq capped now", ref="C"),
@@ -141,21 +143,21 @@ def printer_overview():
                                q(f'node_memory_MemAvailable_bytes{{{H}}}', "available", ref="B"),
                                q(f'node_memory_MemTotal_bytes{{{H}}} - node_memory_MemAvailable_bytes{{{H}}}', "used", ref="C")], 12, y, 12, 8, unit="bytes", min_=0))
     y += 8
-    p.append(ts(33, "Network throughput (wlan0 and friends)", [
+    p.append(ts(33, "Network throughput (physical interfaces)", [
         q(f'rate(node_network_receive_bytes_total{{{H},device!~"lo|docker.*|br-.*|veth.*|tailscale.*"}}[5m]) * 8', "rx {{device}}"),
         q(f'rate(node_network_transmit_bytes_total{{{H},device!~"lo|docker.*|br-.*|veth.*|tailscale.*"}}[5m]) * 8', "tx {{device}}", ref="B")], 0, y, 12, 8, unit="bps", min_=0))
-    p.append(ts(34, "Disk I/O (USB SSD)", [q(f'rate(node_disk_read_bytes_total{{{H},device!~"loop.*|dm-.*|mmcblk.*"}}[5m])', "read {{device}}"),
+    p.append(ts(34, "Disk I/O", [q(f'rate(node_disk_read_bytes_total{{{H},device!~"loop.*|dm-.*|mmcblk.*"}}[5m])', "read {{device}}"),
                                            q(f'rate(node_disk_written_bytes_total{{{H},device!~"loop.*|dm-.*|mmcblk.*"}}[5m])', "write {{device}}", ref="B")], 12, y, 12, 8, unit="Bps", min_=0))
     y += 8
     p.append(ts(35, "Filesystem usage", [
         q(f'(1 - node_filesystem_avail_bytes{{{H},mountpoint="/"}} / node_filesystem_size_bytes{{{H},mountpoint="/"}}) * 100', "/"),
-        q(f'(1 - node_filesystem_avail_bytes{{{H},mountpoint="/boot/firmware"}} / node_filesystem_size_bytes{{{H},mountpoint="/boot/firmware"}}) * 100', "/boot/firmware", ref="B")], 0, y, 12, 7, unit="percent", min_=0, max_=100,
+        q(f'(1 - node_filesystem_avail_bytes{{{H},mountpoint=~"/boot/firmware|/boot/efi"}} / node_filesystem_size_bytes{{{H},mountpoint=~"/boot/firmware|/boot/efi"}}) * 100', "{{mountpoint}}", ref="B")], 0, y, 12, 7, unit="percent", min_=0, max_=100,
         thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 90}]))
     p.append(ts(36, "Load average", [q(f'node_load1{{{H}}}', "1m"), q(f'node_load5{{{H}}}', "5m", ref="B"), q(f'node_load15{{{H}}}', "15m", ref="C")], 12, y, 12, 7, min_=0))
     y += 7
     p.append(row(40, "Logs", y)); y += 1
     p.append(logs(41, "Recent errors / warnings (journal + containers)", f'{{{H}}} |~ "(?i)error|warning|fatal|critical|undervoltage"', 0, y, 24, 10))
-    return dashboard("printer-overview", "Printer host overview", ["printer", "homelab", "node-exporter", "raspberry-pi"], p)
+    return dashboard("printer-overview", "Printer host overview", ["printer", "homelab", "node-exporter", "host"], p)
 
 
 # ── CUPS print server ──
