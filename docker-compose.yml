@@ -138,16 +138,19 @@ services:
   paperless-forwarder:
     build: ./forwarder
     image: cn-printer-paperless-forwarder:local
+    # PAPERLESS_URL / PAPERLESS_TOKEN / PAPERLESS_TAGS / PROCESSED_RETENTION_DAYS
+    # live in ./paperless.env — a second Kauket secret
+    # (printer.cn_printer_paperless_env), like rclone.conf, so the stack's main
+    # .env is never edited in place. Missing file = the forwarder idles.
+    env_file:
+      - path: ./paperless.env
+        required: false
     environment:
-      - PAPERLESS_URL=${PAPERLESS_URL:-https://docs.lab.gn.al}
-      - PAPERLESS_TOKEN=${PAPERLESS_TOKEN:-}
-      - PAPERLESS_TAGS=${PAPERLESS_TAGS:-scanned}
       - INBOX_DIR=/scans/inbox
       - PROCESSED_DIR=/scans/processed
       - FAILED_DIR=/scans/failed
       - STATE_FILE=/scans/.forwarder-state.json
       - TEXTFILE_DIR=/textfile
-      - PROCESSED_RETENTION_DAYS=${PROCESSED_RETENTION_DAYS:-30}
       - SCANS_UID=${SCANS_UID}
       - SCANS_GID=${SCANS_GID}
       - CA_BUNDLE=${PAPERLESS_CA_BUNDLE:-/certs/root_ca.crt}

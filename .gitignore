@@ -9,3 +9,4 @@ rclone/*.conf
 .DS_Store
 __pycache__/
 *.pyc
+paperless.env

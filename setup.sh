@@ -46,7 +46,12 @@ for d in "$SCANS_DIR" "$SCANS_DIR/inbox" "$SCANS_DIR/processed"; do
 done
 [[ "$(stat -c %u "$SCANS_DIR")" == "$SCANS_UID" ]] || warn "$SCANS_DIR is owned by uid $(stat -c %u "$SCANS_DIR"), .env says SCANS_UID=$SCANS_UID"
 mkdir -p "$SCANS_DIR/failed" 2>/dev/null || true   # paperless-forwarder's reject bin (amun printer only creates inbox/processed)
-[[ -n "$(env_get PAPERLESS_TOKEN)" ]] || warn "PAPERLESS_TOKEN is empty — the paperless-forwarder idles and 'PDF → Paperless' scans wait in $SCANS_DIR/inbox (token: cn-paperless scripts/bootstrap.py → Kauket printer.cn_printer_env)"
+penv_get() { grep -E "^${1}=" paperless.env 2>/dev/null | head -1 | cut -d= -f2- || true; }
+if [[ -f paperless.env && -n "$(penv_get PAPERLESS_TOKEN)" ]]; then
+  [[ "$(stat -c %a paperless.env)" == "600" ]] || warn "paperless.env should be mode 0600 (it holds the Paperless API token)"
+else
+  warn "paperless.env missing or PAPERLESS_TOKEN empty — the paperless-forwarder idles and 'PDF → Paperless' scans wait in $SCANS_DIR/inbox (kauket get printer.cn_printer_paperless_env; token from cn-paperless scripts/bootstrap.py)"
+fi
 systemctl is-active --quiet avahi-daemon || warn "avahi-daemon is not active on the host — AirPrint discovery will be missing"
 [[ -d /etc/avahi/services ]] || die "/etc/avahi/services missing — the cups entrypoint writes the AirPrint record there (amun printer installs avahi)"
 if dpkg -s cups >/dev/null 2>&1; then die "a host CUPS is installed — cupsd must only run in this stack (amun printer removes it)"; fi
@@ -115,7 +120,7 @@ cn-printer is up.
 
   Print (CUPS)   :  http://printer.lan:631      (AirPrint/IPP Everywhere on the LAN)
   Scan           :  https://${SCAN_LAN_HOST}     (scanservjs via traefik-lan, step-ca; also http://printer.lan:8080)
-  Paperless      :  $( [[ -n "$(env_get PAPERLESS_TOKEN)" ]] && echo "enabled → $(env_get PAPERLESS_URL) (inbox $SCANS_DIR/inbox → processed/)" || echo "disabled (PAPERLESS_TOKEN empty; scans wait in inbox/)" )
+  Paperless      :  $( [[ -n "$(penv_get PAPERLESS_TOKEN)" ]] && echo "enabled → $(penv_get PAPERLESS_URL) (inbox $SCANS_DIR/inbox → processed/)" || echo "disabled (paperless.env missing; scans wait in inbox/)" )
   Google Drive   :  $( [[ -f rclone/rclone.conf ]] && echo "enabled → $(env_get GDRIVE_REMOTE_PATH)" || echo "disabled (no rclone/rclone.conf)" ) (legacy)
   Tailnet        :  same ports on printer.ts.gn.al
   Metrics        :  :9100 node-exporter, :9329 cups-exporter (kaiser scrapes)
