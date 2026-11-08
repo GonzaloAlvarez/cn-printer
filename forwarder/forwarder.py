@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import ssl
 import sys
@@ -272,7 +273,9 @@ class Forwarder:
             self._rm(path + ".task")
             self.state["forwarded_total"] += 1
             self.state["last_success"] = int(time.time())
-            log(f"consumed {os.path.basename(path)} (document {info.get('related_document')}) → {dest}")
+            m = re.search(r"document id (\d+)", str(info.get("result", "")))
+            doc = info.get("related_document") or (m.group(1) if m else "?")
+            log(f"consumed {os.path.basename(path)} (document {doc}) → {dest}")
             return True
         if status == "FAILURE" or (info is None):
             reason = (info or {}).get("result") or "task vanished from Paperless before it finished"
