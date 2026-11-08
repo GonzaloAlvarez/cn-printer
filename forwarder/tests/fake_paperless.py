@@ -4,6 +4,7 @@ forwarder unit tests (stdlib only). Implements just what the forwarder calls:
   POST /api/documents/post_document/  multipart → saves the upload under OUT_DIR,
                                        returns a JSON task-id string (HTTP 200)
   GET  /api/tasks/?task_id=<id>        → [ {task_id, status, result, related_document} ]
+                                       (status in lower case, as Paperless 3 reports it)
   GET  /api/tags/?name__iexact=<n>     → {results:[{id,name}]} (ids assigned on first sight)
   GET  /api/tags/?page_size=1          → ping
   POST /api/tags/                      → {id,name}
@@ -102,11 +103,11 @@ def make_handler(state: State):
                 tid = str(uuid.uuid4())
                 with state.lock:
                     if filename in state.fail_names:
-                        task = {"task_id": tid, "status": "FAILURE", "related_document": None,
+                        task = {"task_id": tid, "status": "failure", "related_document": None,
                                 "result": f"Not consuming {filename}: rejected by FAIL_NAMES (test)"}
                     else:
                         state.docs += 1
-                        task = {"task_id": tid, "status": "SUCCESS", "related_document": str(state.docs),
+                        task = {"task_id": tid, "status": "success", "related_document": str(state.docs),
                                 "result": f"Success. New document id {state.docs} created"}
                     task["fields"] = fields
                     state.tasks[tid] = task

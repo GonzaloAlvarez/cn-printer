@@ -264,7 +264,9 @@ class Forwarder:
     def settle(self, path: str, task_id: str) -> bool:
         """Poll one task; move the file when it finished. Returns True when settled."""
         info = self.api.task(task_id)
-        status = (info or {}).get("status", "")
+        # Paperless 3 reports Celery states in lower case ("success"); older
+        # releases and the test stand-in use upper case — compare normalised.
+        status = str((info or {}).get("status", "")).upper()
         if status == "SUCCESS":
             dest = move(path, self.cfg["PROCESSED_DIR"])
             self._rm(path + ".task")
