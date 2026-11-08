@@ -155,8 +155,19 @@ def printer_overview():
         thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 90}]))
     p.append(ts(36, "Load average", [q(f'node_load1{{{H}}}', "1m"), q(f'node_load5{{{H}}}', "5m", ref="B"), q(f'node_load15{{{H}}}', "15m", ref="C")], 12, y, 12, 7, min_=0))
     y += 7
+    # scan_forwarder_* — cn-printer's paperless-forwarder (textfile via node-exporter-lan):
+    # scans leaving scanservjs for Paperless-ngx (cn-paperless on kaiser).
+    p.append(row(38, "Scan → Paperless (paperless-forwarder)", y)); y += 1
+    p.append(stat(39, "Inbox pending", [q(f'scan_forwarder_pending_files{{{H}}}')], 0, y, 4, 4, decimals=0, color_mode="background",
+                  thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]))
+    p.append(stat(42, "Paperless reachable", [q(f'scan_forwarder_paperless_reachable{{{H}}}')], 4, y, 4, 4, mappings=UPDOWN, color_mode="background", thresholds=GREEN_ON_1))
+    p.append(stat(43, "Forwarded (total)", [q(f'scan_forwarder_forwarded_total{{{H}}}')], 8, y, 4, 4, decimals=0))
+    p.append(stat(44, "Rejected by Paperless (total)", [q(f'scan_forwarder_failed_total{{{H}}}')], 12, y, 4, 4, decimals=0,
+                  thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}]))
+    p.append(stat(45, "Last scan consumed", [q(f'scan_forwarder_last_success_timestamp_seconds{{{H}}} * 1000')], 16, y, 8, 4, unit="dateTimeFromNow"))
+    y += 4
     p.append(row(40, "Logs", y)); y += 1
-    p.append(logs(41, "Recent errors / warnings (journal + containers)", f'{{{H}}} |~ "(?i)error|warning|fatal|critical|undervoltage"', 0, y, 24, 10))
+    p.append(logs(41, "Recent errors / warnings (journal + containers)", f'{{{H}}} |~ "(?i)error|warning|fatal|critical|undervoltage|\\[forwarder\\]"', 0, y, 24, 10))
     return dashboard("printer-overview", "Printer host overview", ["printer", "homelab", "node-exporter", "host"], p)
 
 

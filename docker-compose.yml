@@ -125,6 +125,41 @@ services:
       com.centurylinklabs.watchtower.enable: "false"   # local build (pinned upstream tag inside)
     restart: unless-stopped
 
+  # ── paperless-forwarder: /srv/scans/inbox → Paperless-ngx (cn-paperless) ──
+  # The "PDF → Paperless" pipeline and the Files-tab action move finished scans
+  # into inbox/; this watcher uploads them through the Paperless REST API with
+  # the `scanner` token (Kauket), waits for the consumption task and files them
+  # under processed/ (failed/ + a marker when Paperless rejects one). It sits
+  # on the project BRIDGE, not in the ts-printer netns: the host resolver
+  # answers the split-horizon name (docs.lab.gn.al → kaiser) and step-ca is
+  # trusted through the root setup.sh fetched. Root on purpose — it writes the
+  # node-exporter textfile dir (scan_forwarder_* metrics → kaiser alerts);
+  # moved files keep uid 1000, markers are chowned to SCANS_UID.
+  paperless-forwarder:
+    build: ./forwarder
+    image: cn-printer-paperless-forwarder:local
+    environment:
+      - PAPERLESS_URL=${PAPERLESS_URL:-https://docs.lab.gn.al}
+      - PAPERLESS_TOKEN=${PAPERLESS_TOKEN:-}
+      - PAPERLESS_TAGS=${PAPERLESS_TAGS:-scanned}
+      - INBOX_DIR=/scans/inbox
+      - PROCESSED_DIR=/scans/processed
+      - FAILED_DIR=/scans/failed
+      - STATE_FILE=/scans/.forwarder-state.json
+      - TEXTFILE_DIR=/textfile
+      - PROCESSED_RETENTION_DAYS=${PROCESSED_RETENTION_DAYS:-30}
+      - SCANS_UID=${SCANS_UID}
+      - SCANS_GID=${SCANS_GID}
+      - CA_BUNDLE=${PAPERLESS_CA_BUNDLE:-/certs/root_ca.crt}
+      - TZ=${TIMEZONE}
+    volumes:
+      - ${SCANS_DIR}:/scans
+      - /var/lib/node_exporter/textfile_collector:/textfile
+      - ./certs/root_ca.crt:/certs/root_ca.crt:ro     # fetched by setup.sh
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # local build
+    restart: unless-stopped
+
   # ── LAN edge: https://scan.print.lan → scanservjs ─────────────────────────
   # Host network like cn-nvr's traefik-lan: it owns the Pi's 80/443 (ufw holes
   # from amun printer — host-network listeners do not bypass ufw) and reaches

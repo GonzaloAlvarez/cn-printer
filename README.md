@@ -1,6 +1,6 @@
 # cn-printer
 
-USB print + scan server for the **Brother MFC-L2750DW** on `printer.lan` (Intel NUC5i5RYH on Ubuntu 26.04, WiFi VLAN; a Raspberry Pi 4 until its USB root SSD died on 2026-10-19). A Docker Compose stack in the homelab "sidecar" shape: a Tailscale sidecar owns the network namespace, CUPS and scanservjs join it, a host-network Traefik serves the scan UI as **`https://scan.print.lan`** with a step-ca certificate, and host-network exporters report to kaiser. Scans default to **PDF** (searchable-PDF variants via tesseract) and can go **straight to Google Drive**.
+USB print + scan server for the **Brother MFC-L2750DW** on `printer.lan` (Intel NUC5i5RYH on Ubuntu 26.04, WiFi VLAN; a Raspberry Pi 4 until its USB root SSD died on 2026-10-19). A Docker Compose stack in the homelab "sidecar" shape: a Tailscale sidecar owns the network namespace, CUPS and scanservjs join it, a host-network Traefik serves the scan UI as **`https://scan.print.lan`** with a step-ca certificate, and host-network exporters report to kaiser. Scans default to **PDF → Paperless**: the finished PDF goes to [Paperless-ngx](https://github.com/GonzaloAlvarez/cn-paperless) on kaiser (`https://docs.lab.gn.al`) through a small forwarder container; searchable-PDF variants via tesseract remain, and the legacy **Google Drive** upload stays until the Drive migration is done.
 
 Companion host plugin: [amun-printer](https://github.com/GonzaloAlvarez/amun-printer) (ipp-usb on the host, usblp blacklist, persistent journal, watchdog, memory cgroup, `/srv/scans`, ufw holes incl. 80/443).
 
@@ -13,7 +13,8 @@ printer.lan (host)   ipp-usb :60000 on all interfaces (IPP + eSCL)   avahi-daemo
    ts-printer   tailscale sidecar `printer` (tag:svc); publishes 631 8080 on the LAN
    ├─ cups      own trixie image · queue Brother_MFC-L2750DW → ipp://172.30.6.1:60000/ipp/print · raster-only PPD
    └─ scanservjs  own image (sbs20/scanservjs:v3.3.0 + rclone) · eSCL via sane-airscan → http://172.30.6.1:60000/eSCL
-                 PDF-first pipelines · OCR (tesseract) · "→ Google Drive" pipelines + Files-tab action · output /srv/scans
+                 PDF-first pipelines · OCR (tesseract) · "→ Paperless" (default) and legacy "→ Google Drive" pipelines + Files-tab actions · output /srv/scans
+   └─ paperless-forwarder  own image (python:3.12-alpine) on the project bridge · /srv/scans/inbox → POST docs.lab.gn.al/api/documents/post_document/ → processed/ (failed/ + marker on rejection) · scan_forwarder_* textfile metrics
    node-exporter-lan :9100 · cups-exporter :9329 · promtail-lan → kaiser Loki · watchtower · backup (offen)
 ```
 
@@ -55,11 +56,16 @@ Names (once): `scan.print.lan → 10.2.0.30` in `cn-dnsdhcpd/dns/records.tsv` (`
 
 Printing needs no login. The `:631` admin pages ask for `CUPS_ADMIN_USER` / `CUPS_ADMIN_PASSWORD`. AirPrint/Mopria discovery works on the WiFi VLAN only (mDNS does not cross VLANs or the tailnet); elsewhere add the printer by URL. `scan.print.lan` resolves on the LAN only.
 
-## Scanning: PDF, OCR, Google Drive
+## Scanning: PDF, OCR, Paperless, Google Drive (legacy)
 
-- **Default = PDF.** The pipeline dropdown opens on `PDF (JPG | high quality)`; the other upstream outputs (JPG/PNG/TIF, OCR text) are still there. `OCR | PDF (JPG | high quality)` produces a **searchable** PDF (tesseract, languages from `SCAN_OCR_LANG`, default `eng+spa`); on the former Pi 4 it took ~10–20 s per page at 300 dpi; the NUC is several times faster.
+- **Default = `PDF → Paperless`.** The scan is written to `/srv/scans` as a high-quality JPG PDF and immediately moved into `/srv/scans/inbox/` (`scanservjs/config.local.js`, action *Send to Paperless (background)*). The `paperless-forwarder` container (`forwarder/forwarder.py`) waits until the file is stable, uploads it to `PAPERLESS_URL` (`https://docs.lab.gn.al`, Paperless-ngx on kaiser) with the `scanner` user's token and the tag `scanned`, polls the consumption task and moves the file to `processed/` (deleted after `PROCESSED_RETENTION_DAYS`, default 30) or — if Paperless rejected it — to `failed/` next to a `<name>.paperless-FAILED.txt` marker with the reason. Paperless does the OCR (`auto` mode), so the plain PDF is what is sent; the household sees the document through Paperless's "Household documents" workflow. Anything already scanned: *Files* tab → select → *Send to Paperless*. Anything else dropped into `inbox/` (Samba later) is forwarded the same way.
+- **When Paperless is unreachable** nothing is lost: files stay in `inbox/`, the forwarder retries with a capped backoff and exports `scan_forwarder_pending_files` / `scan_forwarder_paperless_reachable` through node-exporter's textfile dir; kaiser alerts `ScanInboxStuck` (30 min) and `ScanForwardFailed`, and the *printer-overview* dashboard has a "Scan → Paperless" row. A `.task` sidecar next to a queued file records the Paperless task id, so a forwarder restart never uploads twice.
+- The forwarder runs on the compose **bridge**, not in the `ts-printer` netns: there the host resolver answers the split-horizon name (`docs.lab.gn.al → 10.1.1.140` via pfSense/Technitium) and step-ca is trusted through `certs/root_ca.crt` (`CA_BUNDLE`). It runs as root only to write the root-owned textfile dir; moved files keep uid 1000 and markers are chowned to `SCANS_UID`.
+- `PAPERLESS_TOKEN` (Kauket `printer.cn_printer_env`) is printed once by `cn-paperless/scripts/bootstrap.py`; with it empty the forwarder idles and scans wait in `inbox/`.
+
+- **Plain PDF.** `PDF (JPG | high quality)` is second in the dropdown for scans that should stay out of Paperless; the other upstream outputs (JPG/PNG/TIF, OCR text) are still there. `OCR | PDF (JPG | high quality)` produces a **searchable** PDF (tesseract, languages from `SCAN_OCR_LANG`, default `eng+spa`); on the former Pi 4 it took ~10–20 s per page at 300 dpi; the NUC is several times faster.
 - **Multi-page documents:** source *ADF* + batch *auto* feeds the whole stack into one PDF; on the flatbed use batch *manual* and press *Next* per page.
-- **To Google Drive:** pick `PDF → Google Drive` or `PDF (OCR) → Google Drive` — the file is written to `/srv/scans` as usual and then uploaded to `GDRIVE_REMOTE_PATH` (`gdrive:Scans`, i.e. a `Scans` folder at the top of My Drive) in the background. Anything already scanned: *Files* tab → select → *Upload to Google Drive*. A failed background upload leaves `<scan>.gdrive-FAILED.txt` next to the scan (visible in *Files*) with the rclone error; the Files-tab action reports errors in the UI directly.
+- **To Google Drive (legacy, last in the list; remove once the Drive migration is finished):** pick `PDF → Google Drive` or `PDF (OCR) → Google Drive` — the file is written to `/srv/scans` as usual and then uploaded to `GDRIVE_REMOTE_PATH` (`gdrive:Scans`, i.e. a `Scans` folder at the top of My Drive) in the background. Anything already scanned: *Files* tab → select → *Upload to Google Drive*. A failed background upload leaves `<scan>.gdrive-FAILED.txt` next to the scan (visible in *Files*) with the rclone error; the Files-tab action reports errors in the UI directly.
 - **Drive credentials** (`rclone/rclone.conf`, Kauket `printer.cn_printer_rclone_conf`) are minted on a machine with a browser by [`scripts/gdrive-auth.sh`](scripts/gdrive-auth.sh) — read its header: it needs your own Google Cloud OAuth client (Desktop app, scope `drive.file`, consent screen **published**; an app left "in testing" gets tokens that expire after 7 days), opens the login, verifies the token against Drive, and hands the file to Kauket (`--kauket`). On the host: `kauket get printer.cn_printer_rclone_conf` — no container restart needed. To revoke: delete the OAuth client in Google Cloud (or the app under myaccount.google.com → Security → Third-party access) and `kauket remove` the secret.
 - With `drive.file`, rclone only sees files it created: `rclone lsd gdrive:` shows just `Scans`, and an existing folder of yours with the same name is *not* reused (Drive allows duplicates). Rename or merge in Drive if that matters.
 
@@ -79,7 +85,7 @@ docker compose exec scanservjs rclone --config /etc/rclone/rclone.conf lsd gdriv
 sudo systemctl restart docker-compose@cn-printer             # whole-stack restart through the boot unit
 ```
 
-State: `cups_etc` volume (printers.conf, PPD, the helper's state copy), `traefik_lan_acme` (the step-ca leaf — disposable, re-issued on loss) and `/srv/scans` on the host. Scans and the CUPS config are backed up weekly by offen (Sun 01:30) to `s3://cloudnet-lab-storage/printer/` and the raidnas WebDAV share `/printer/`; the queue itself is reproducible from `.env` (`setup.sh` re-creates it). Restore = `kauket get` (both secrets) + `./setup.sh`, then untar scans into `/srv/scans`.
+State: `cups_etc` volume (printers.conf, PPD, the helper's state copy), `traefik_lan_acme` (the step-ca leaf — disposable, re-issued on loss) and `/srv/scans` on the host (`inbox/` = queue for Paperless, `processed/` = 30-day copy of what Paperless consumed, `failed/` = rejected, `.forwarder-state.json` = the forwarder's counters). Scans and the CUPS config are backed up weekly by offen (Sun 01:30) to `s3://cloudnet-lab-storage/printer/` and the raidnas WebDAV share `/printer/`; the queue itself is reproducible from `.env` (`setup.sh` re-creates it). Restore = `kauket get` (both secrets) + `./setup.sh`, then untar scans into `/srv/scans`.
 
 Trigger a backup by hand: `docker compose exec backup /usr/bin/backup`.
 
@@ -100,6 +106,7 @@ Deliberate omissions: no Consul/traefik-lab route (plain HTTP on the tailnet by 
 - queue created on the virtual printer, default, shared; `printer-queue-setup` re-run prints `UNCHANGED`; the PPD keeps `image/pwg-raster|urf` and has **no** `application/pdf`/`image/jpeg` passthrough;
 - `lp` of a two-page PDF → the spooled document is PWG/URF raster (`EVIDENCE: print → …`);
 - scanservjs REST scan to PNG, PDF and **OCR PDF**, downloaded and type-checked; **PDF is the default pipeline**;
+- `PDF → Paperless` is the default pipeline: the scan leaves `inbox/`, lands on the fake Paperless API (`forwarder/tests/fake_paperless.py`, `.test/paperless-out`) and in `processed/`; the Files-tab action *Send to Paperless* does the same for an existing scan; a file dropped straight into `inbox/` is forwarded; a file the fake rejects (`FAIL_NAMES=reject-me.pdf`) ends in `failed/` with a marker; with the fake stopped the file waits and `scan_forwarder_pending_files 1` / `scan_forwarder_paperless_reachable 0` are written, and it drains when the fake returns; the textfile metrics parse. `python3 -m unittest discover -s forwarder/tests` covers the forwarder in-process;
 - `PDF → Google Drive` lands the file on the stand-in remote with no `.gdrive-FAILED` marker; the Files-tab action uploads an existing scan; the action without `rclone.conf` fails with HTTP 500 and the server stays up;
 - traefik-lan routes `Host: scan.print.lan` to scanservjs and 404s an unknown host;
 - scans are owned by uid 1000 (Linux only; Docker Desktop virtualizes bind-mount ownership);
@@ -112,7 +119,7 @@ Deliberate omissions: no Consul/traefik-lab route (plain HTTP on the tailnet by 
 
 On macOS Docker Desktop a long scan request is occasionally dropped by the port forwarder; the scan step retries once (a real failure still fails both attempts). Linux runs (kora VM, rpid11, the Pi) have never shown it.
 
-Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --post tests/vm-e2e.sh`), after `amun`, `amun docker` and `amun printer` have converged. Static checks: `docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test config --quiet`, `shellcheck cups/* setup.sh test scripts/*.sh`, `node --check scanservjs/config.local.js`, `python3 -m py_compile cups-exporter/exporter.py cups-exporter/brother_ews.py`, `python3 -m unittest discover -s cups-exporter/tests`.
+Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --post tests/vm-e2e.sh`), after `amun`, `amun docker` and `amun printer` have converged. Static checks: `docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test config --quiet`, `shellcheck cups/* setup.sh test scripts/*.sh`, `node --check scanservjs/config.local.js`, `python3 -m py_compile cups-exporter/exporter.py cups-exporter/brother_ews.py forwarder/forwarder.py`, `python3 -m unittest discover -s cups-exporter/tests`, `python3 -m unittest discover -s forwarder/tests`.
 
 ## Gotchas
 
@@ -121,6 +128,7 @@ Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --pos
 - **`PRINTER_DEVICE_URI`/`PRINTER_ESCL_URL` hardcode the bridge gateway** `172.30.6.1`; if the IPAM block changes, change them too and re-run `./setup.sh`.
 - **`traefik-lan/dynamic.yml` is a single-file bind mount**: `setup.sh` re-renders it in place (same inode, Traefik's watcher sees it), but a `git pull` that changes the template needs `docker compose up -d --force-recreate --no-deps traefik-lan`. A `TRAEFIK DEFAULT CERT` in the browser means HTTP-01 failed: check the pfSense Host Override (cn-home `LAN_HOSTS`), the Technitium record and `ufw status` (80/443 from Anywhere).
 - **The host-network Traefik gets an empty `resolv.conf`** on this Docker version — the only name it dials, `PKI_HOST`, is pinned through `extra_hosts` with `PKI_IP`.
+- **The forwarder never re-uploads**: the `.task` sidecar in `inbox/` holds the Paperless task id; a task that vanished before finishing sends the file to `failed/`. Paperless 3 accepts duplicates (flagged in its Duplicates tab), so re-queueing a file from `failed/` by moving it back into `inbox/` is safe.
 - **scanservjs runs the pipeline `afterAction` without awaiting it**: a rejecting action would be an unhandled promise rejection and kill the server. That is why the pipelines use the "(background)" action, which catches and writes the `.gdrive-FAILED.txt` marker, while the Files-tab action throws so the UI can show the error.
 - **`rclone/rclone.conf` is mounted read-write on purpose** and must be readable by uid 1000 (`kauket get` as gonzalo gives exactly that): rclone rewrites the `token` line when it refreshes the access token. The refresh token itself does not change, so the Kauket copy stays valid; re-mint only if Google revokes it (7-day expiry = the OAuth app was left "in testing").
 - **`rclone authorize` wants its JSON blob in URL-safe, unpadded base64** — standard base64 fails with `decode simple map: illegal base64 data`. `scripts/gdrive-auth.sh` does this right; the blob is what lets us request `drive.file` instead of full `drive`.
@@ -132,7 +140,7 @@ Inside a kora VM the same script is run by `amun-printer/test` (`amun/test --pos
 
 ## Next on this box (compatible by design)
 
-Stirling-PDF (`stirlingtools/stirling-pdf:3.1.0`, `JAVA_TOOL_OPTIONS=-Xmx1g`, `mem_limit` works because amun-printer enables the memory cgroup) watching `/srv/scans/inbox` → `/srv/scans/processed`, published through `traefik-lan` as `pdf.print.lan` (one more router + the two DNS records); a Samba share of `/srv/scans` (`ghcr.io/servercontainers/samba`, host network, `NETBIOS_DISABLE=1`, wsdd2, host avahi `smb.xml`). Either joins this project or a sibling stack with `boot.after: [cn-printer]`.
+Stirling-PDF (`stirlingtools/stirling-pdf:3.1.0`, `JAVA_TOOL_OPTIONS=-Xmx1g`, `mem_limit` works because amun-printer enables the memory cgroup) watching its own folder (`/srv/scans/inbox` is the Paperless queue now — give Stirling `/srv/scans/pdf-in` → `pdf-out`), published through `traefik-lan` as `pdf.print.lan` (one more router + the two DNS records); a Samba share of `/srv/scans` (`ghcr.io/servercontainers/samba`, host network, `NETBIOS_DISABLE=1`, wsdd2, host avahi `smb.xml`). Either joins this project or a sibling stack with `boot.after: [cn-printer]`.
 
 ## License
 

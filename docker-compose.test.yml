@@ -18,11 +18,14 @@ services:
     devices: !reset []
     volumes: !reset []
     environment: !reset []
+    # Loopback ports come from .env.test (TEST_*_PORT) and can be overridden in
+    # the shell (`TEST_SCAN_PORT=28080 ./test`) when something else on the
+    # machine already owns one of them.
     ports: !override
-      - "127.0.0.1:16310:631"    # cups
-      - "127.0.0.1:18080:8080"   # scanservjs
-      - "127.0.0.1:19329:9329"   # cups-exporter (joins the netns in test)
-      - "127.0.0.1:18081:18081"  # traefik-lan (joins the netns in test; plain HTTP)
+      - "127.0.0.1:${TEST_CUPS_PORT:-16310}:631"    # cups
+      - "127.0.0.1:${TEST_SCAN_PORT:-18080}:8080"   # scanservjs
+      - "127.0.0.1:${TEST_EXP_PORT:-19329}:9329"    # cups-exporter (joins the netns in test)
+      - "127.0.0.1:${TEST_EDGE_PORT:-18081}:18081"  # traefik-lan (joins the netns in test; plain HTTP)
 
   ippeve:
     image: cn-printer-ippeve:test
@@ -97,6 +100,35 @@ services:
       - PRINTER_EWS_URL=http://localhost:8632
       - PRINTER_EWS_INTERVAL=5
       - EXPORTER_PORT=9329
+
+  # Stand-in for Paperless-ngx (forwarder/tests/fake_paperless.py): accepts the
+  # multipart upload, answers the task poll, keeps the files in .test/paperless-out.
+  # reject-me.pdf ends in FAILURE so the failed/ path is exercised too.
+  fake-paperless:
+    image: python:3.12-alpine
+    command: ["python3", "-u", "/srv/fake_paperless.py"]
+    environment:
+      - PORT=8000
+      - OUT_DIR=/out
+      - FAKE_TOKEN=test-token
+      - FAIL_NAMES=reject-me.pdf
+    volumes:
+      - ./forwarder/tests/fake_paperless.py:/srv/fake_paperless.py:ro
+      - ./.test/paperless-out:/out
+    ports:
+      - "127.0.0.1:${TEST_PAPERLESS_PORT:-18000}:8000"
+    restart: "no"
+
+  paperless-forwarder:
+    depends_on: [fake-paperless]
+    environment:
+      - POLL_SECONDS=2
+      - STABILITY_SECONDS=1
+      - TASK_POLL_SECONDS=1
+      - CA_BUNDLE=                 # plain HTTP to the fake; no step-ca root in test
+    volumes: !override
+      - ./.test/scans:/scans
+      - ./.test/textfile:/textfile
 
   node-exporter-lan:
     profiles: ["prod"]

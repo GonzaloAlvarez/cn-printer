@@ -5,9 +5,13 @@
 #   scan : scanservjs REST on the SANE `test` device → downloadable PNG and PDF
 #   edge : traefik-lan routes Host: scan.print.lan to scanservjs
 #   files: scans land as uid 1000 (Linux only; Docker Desktop virtualizes ownership)
-#   drive: PDF is the default pipeline; OCR PDF works; "→ Google Drive" pipeline
-#          and the Files-tab action land the file on the rclone remote (a local
-#          stand-in in test)
+#   paperless: "PDF → Paperless" is the default pipeline; the scan moves to inbox/
+#          and the forwarder uploads it to the fake Paperless API (files land in
+#          .test/paperless-out, then processed/); the Files-tab action, a dropped
+#          file, a rejected file (failed/ + marker), an unreachable Paperless
+#          (pending metric, drains on return) and the textfile metrics
+#   drive: OCR PDF works; the legacy "→ Google Drive" pipeline and the Files-tab
+#          action land the file on the rclone remote (a local stand-in in test)
 #   cups-exporter: cups_up 1, printer state idle, Brother maintenance-page counters
 #          (parsed from a captured page served by a busybox stand-in)
 #   ./test [--in-vm] [--keep]      --keep leaves the stack up for inspection
@@ -26,7 +30,9 @@ done
 
 P=cn-printer-test
 DC=(docker compose -f docker-compose.yml -f docker-compose.test.yml --env-file .env.test -p "$P")
-CUPS=http://127.0.0.1:16310; SCAN=http://127.0.0.1:18080; EXP=http://127.0.0.1:19329; EDGE=http://127.0.0.1:18081
+# ports: shell env > .env.test > defaults (docker compose resolves the same way)
+tp() { local v; v="${!1:-}"; [ -n "$v" ] || v="$(grep -E "^$1=" .env.test | cut -d= -f2-)"; echo "${v:-$2}"; }
+CUPS=http://127.0.0.1:$(tp TEST_CUPS_PORT 16310); SCAN=http://127.0.0.1:$(tp TEST_SCAN_PORT 18080); EXP=http://127.0.0.1:$(tp TEST_EXP_PORT 19329); EDGE=http://127.0.0.1:$(tp TEST_EDGE_PORT 18081); PLESS=http://127.0.0.1:$(tp TEST_PAPERLESS_PORT 18000)
 Q=Brother_MFC-L2750DW
 PASS=0; FAIL=0; WARN=0; SKIP=0
 LINUX=0; [ "$(uname -s)" = Linux ] && LINUX=1   # bind-mount ownership is only meaningful on Linux (Docker Desktop virtualizes it)
@@ -49,8 +55,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cn-printer test =="
-mkdir -p .test/scans .test/cups-log .test/rclone .test/drive-out
-chmod 0777 .test/scans .test/cups-log .test/rclone .test/drive-out   # containers write/rename as uid 1000 / root
+mkdir -p .test/scans/inbox .test/scans/processed .test/scans/failed .test/cups-log .test/rclone .test/drive-out .test/paperless-out .test/textfile
+chmod 0777 .test/scans .test/scans/inbox .test/scans/processed .test/scans/failed .test/cups-log .test/rclone .test/drive-out .test/paperless-out .test/textfile   # containers write/rename as uid 1000 / root
+rm -f .test/scans/inbox/* .test/scans/processed/* .test/scans/failed/* .test/scans/.forwarder-state.json .test/paperless-out/* .test/textfile/* 2>/dev/null || true
 printf '[options]\ndiscovery = disable\n' > .test/airscan.conf    # no real scanner in test
 printf '[gdrive]\ntype = local\n' > .test/rclone/rclone.conf       # Google Drive stand-in: rclone local remote
 rm -f .test/drive-out/* 2>/dev/null || true
@@ -143,8 +150,50 @@ check "scan to PNG via REST, downloadable" scan_one "PNG" '^.PNG'
 png_name="$LAST_SCAN_NAME"
 check "scan to PDF via REST, downloadable" scan_one "PDF (JPG | @:pipeline.high-quality)" '^%PDF'
 check "scan files listed by the API" bash -c "curl -fsS '$SCAN/api/v1/files' | python3 -c 'import json,sys; sys.exit(0 if len(json.load(sys.stdin))>=2 else 1)'"
-check "default pipeline is PDF" bash -c "curl -fsS '$SCAN/api/v1/context' | python3 -c 'import json,sys; d=json.load(sys.stdin); dflt=d[\"devices\"][0][\"settings\"][\"pipeline\"][\"default\"]; print(dflt); sys.exit(0 if dflt.startswith(\"PDF\") else 1)'"
+check "default pipeline is 'PDF → Paperless'" bash -c "curl -fsS '$SCAN/api/v1/context' | python3 -c 'import json,sys; d=json.load(sys.stdin); dflt=d[\"devices\"][0][\"settings\"][\"pipeline\"][\"default\"]; print(dflt); sys.exit(0 if dflt == \"PDF → Paperless\" else 1)'"
 check "scan to searchable PDF (tesseract OCR)" scan_one "@:pipeline.ocr | PDF (JPG | @:pipeline.high-quality)" '^%PDF'
+
+# ── Paperless (inbox → paperless-forwarder → fake Paperless API) ─────────────
+echo; echo "Paperless:"
+pl_wait() { # file expected in .test/paperless-out AND .test/scans/processed within ~60s
+  local i; for ((i = 0; i < 60; i += 2)); do [ -s ".test/paperless-out/$1" ] && [ -s ".test/scans/processed/$1" ] && return 0; sleep 2; done
+  ls -la .test/scans/inbox .test/scans/processed .test/paperless-out | sed 's/^/      | /'; return 1
+}
+pl_scan() { # scan with the Paperless pipeline; the afterAction moves the file to inbox/ so we only parse the name
+  local body resp
+  body="$(python3 -c 'import json,sys; print(json.dumps({"params":{"deviceId":sys.argv[1],"resolution":300,"mode":"Color","source":"Flatbed","top":0,"left":0,"width":210,"height":297},"filters":[],"pipeline":"PDF → Paperless","batch":"none","index":1}))' "$dev")"
+  resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan" 2>/dev/null)" \
+    || { sleep 5; resp="$(curl -sS -m 180 -H 'content-type: application/json' -d "$body" "$SCAN/api/v1/scan")" || return 1; }
+  LAST_SCAN_NAME="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["file"]["name"])' "$resp" 2>/dev/null)" || { note "paperless scan: $resp"; return 1; }
+}
+check "scan with the 'PDF → Paperless' pipeline" pl_scan
+if [ -n "$LAST_SCAN_NAME" ]; then
+  check "forwarder uploaded it and filed it under processed/" pl_wait "$LAST_SCAN_NAME"
+  check "no .paperless-FAILED marker was written" bash -c "! ls .test/scans/ | grep -q 'paperless-FAILED'"
+  check "the upload is a PDF" has_magic ".test/paperless-out/$LAST_SCAN_NAME" '^%PDF'
+  check "fake Paperless API answers with the token" bash -c "curl -fsS -H 'Authorization: Token test-token' '$PLESS/api/tasks/?task_id=' >/dev/null"
+  [ -s ".test/paperless-out/$LAST_SCAN_NAME" ] && evidence "paperless (pipeline) → .test/paperless-out/$LAST_SCAN_NAME: $(describe ".test/paperless-out/$LAST_SCAN_NAME")"
+fi
+if [ -n "$png_name" ]; then
+  enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$png_name")"
+  check "Files-tab action 'Send to Paperless' on an existing scan" curl -fsS -X POST "$SCAN/api/v1/files/$enc/actions/Send%20to%20Paperless"
+  check "action's file reached Paperless and processed/" pl_wait "$png_name"
+fi
+printf '%%PDF-1.4 dropped\n' > .test/scans/inbox/drop-me.pdf
+printf '%%PDF-1.4 rejected\n' > .test/scans/inbox/reject-me.pdf
+check "a file dropped straight into inbox/ is forwarded" pl_wait "drop-me.pdf"
+rj_wait() { local i; for ((i = 0; i < 40; i += 2)); do [ -f .test/scans/failed/reject-me.pdf ] && [ -f .test/scans/failed/reject-me.pdf.paperless-FAILED.txt ] && return 0; sleep 2; done; return 1; }
+check "a file Paperless rejects ends in failed/ with a marker" rj_wait
+check "inbox is empty afterwards" bash -c "[ -z \"\$(ls -A .test/scans/inbox 2>/dev/null)\" ]"
+"${DC[@]}" stop fake-paperless >/dev/null 2>&1
+printf '%%PDF-1.4 waiting\n' > .test/scans/inbox/wait-me.pdf
+pend_wait() { local i; for ((i = 0; i < 40; i += 2)); do grep -qx 'scan_forwarder_pending_files 1' .test/textfile/scan_forwarder.prom 2>/dev/null && grep -qx 'scan_forwarder_paperless_reachable 0' .test/textfile/scan_forwarder.prom && return 0; sleep 2; done; cat .test/textfile/scan_forwarder.prom 2>/dev/null | sed 's/^/      | /'; return 1; }
+check "with Paperless down the file waits and the pending metric says so" pend_wait
+check "the waiting file is still in inbox/" test -f .test/scans/inbox/wait-me.pdf
+"${DC[@]}" start fake-paperless >/dev/null 2>&1
+check "it drains once Paperless is back" pl_wait "wait-me.pdf"
+check "textfile metrics parse (forwarded 4, failed 1, reachable 1)" bash -c "grep -qx 'scan_forwarder_forwarded_total 4' .test/textfile/scan_forwarder.prom && grep -qx 'scan_forwarder_failed_total 1' .test/textfile/scan_forwarder.prom && grep -qx 'scan_forwarder_paperless_reachable 1' .test/textfile/scan_forwarder.prom"
+evidence "forwarder metrics: $(grep -v '^#' .test/textfile/scan_forwarder.prom 2>/dev/null | tr '\n' ' ')"
 
 # ── Google Drive (rclone → a local stand-in remote mounted at .test/drive-out) ─
 echo; echo "Google Drive:"
@@ -155,6 +204,9 @@ if [ -n "$LAST_SCAN_NAME" ]; then
   check "no .gdrive-FAILED marker was written" bash -c "! ls .test/scans/ | grep -q 'gdrive-FAILED'"
   [ -s ".test/drive-out/$LAST_SCAN_NAME" ] && evidence "drive (pipeline) → .test/drive-out/$LAST_SCAN_NAME: $(describe ".test/drive-out/$LAST_SCAN_NAME")"
 fi
+# the first PNG went to Paperless above; scan another one for the Drive action
+check "scan a second PNG for the Drive action" scan_one "PNG" '^.PNG'
+png_name="$LAST_SCAN_NAME"
 if [ -n "$png_name" ]; then
   enc="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$png_name")"
   check "Files-tab action 'Upload to Google Drive' on an existing scan" curl -fsS -X POST "$SCAN/api/v1/files/$enc/actions/Upload%20to%20Google%20Drive"
