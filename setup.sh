@@ -90,6 +90,11 @@ fi
 # ── bring the stack up ───────────────────────────────────────────────────────
 log "docker compose up -d --build --remove-orphans"
 docker compose up -d --build --remove-orphans
+# Single-file bind mounts (config.local.js, airscan.conf, dynamic.yml) keep the
+# old inode after a git pull/render: recreate their consumers so the files on
+# disk are what runs ("recreate, do not reload"). --no-deps keeps the sidecar up.
+log "recreating the single-file-mount consumers (scanservjs, traefik-lan, paperless-forwarder)"
+docker compose up -d --force-recreate --no-deps scanservjs traefik-lan paperless-forwarder
 
 log "waiting for cupsd (up to 2m)"
 for i in $(seq 1 24); do
