@@ -102,13 +102,17 @@ def make_handler(state: State):
                     f.write(data)
                 tid = str(uuid.uuid4())
                 with state.lock:
+                    # Paperless 3.4 field names (result_data / related_document_ids);
+                    # the legacy result / related_document are kept for older clients.
                     if filename in state.fail_names:
-                        task = {"task_id": tid, "status": "failure", "related_document": None,
-                                "result": f"Not consuming {filename}: rejected by FAIL_NAMES (test)"}
+                        msg = f"Not consuming {filename}: rejected by FAIL_NAMES (test)"
+                        task = {"task_id": tid, "status": "failure", "related_document": None, "related_document_ids": [],
+                                "result": msg, "result_data": msg}
                     else:
                         state.docs += 1
+                        msg = f"Success. New document id {state.docs} created"
                         task = {"task_id": tid, "status": "success", "related_document": str(state.docs),
-                                "result": f"Success. New document id {state.docs} created"}
+                                "related_document_ids": [state.docs], "result": msg, "result_data": msg}
                     task["fields"] = fields
                     state.tasks[tid] = task
                 return self._json(200, tid)

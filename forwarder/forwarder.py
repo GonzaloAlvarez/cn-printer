@@ -268,17 +268,21 @@ class Forwarder:
         # Paperless 3 reports Celery states in lower case ("success"); older
         # releases and the test stand-in use upper case — compare normalised.
         status = str((info or {}).get("status", "")).upper()
+        # Paperless 3.4 exposes result_data / related_document_ids; older releases
+        # result / related_document — read both.
+        note = str((info or {}).get("result_data") or (info or {}).get("result") or "")
+        ids = (info or {}).get("related_document_ids") or []
         if status == "SUCCESS":
             dest = move(path, self.cfg["PROCESSED_DIR"])
             self._rm(path + ".task")
             self.state["forwarded_total"] += 1
             self.state["last_success"] = int(time.time())
-            m = re.search(r"document id (\d+)", str(info.get("result", "")))
-            doc = info.get("related_document") or (m.group(1) if m else "?")
+            m = re.search(r"document id (\d+)", note)
+            doc = (str(ids[0]) if ids else None) or info.get("related_document") or (m.group(1) if m else "?")
             log(f"consumed {os.path.basename(path)} (document {doc}) → {dest}")
             return True
         if status == "FAILURE" or (info is None):
-            reason = (info or {}).get("result") or "task vanished from Paperless before it finished"
+            reason = note or ("task vanished from Paperless before it finished" if info is None else "Paperless reported FAILURE without a reason")
             dest = move(path, self.cfg["FAILED_DIR"])
             self._rm(path + ".task")
             write_marker(dest + ".paperless-FAILED.txt",
